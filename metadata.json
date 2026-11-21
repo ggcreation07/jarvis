@@ -1,0 +1,8 @@
+{
+  "name": "JARVIS",
+  "description": "Personal AI assistant and smart device HUD with voice, memory, routines, gestures, and remote PC/TV control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

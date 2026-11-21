@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JARVIS</string>
+    <string name="app_wordmark">J.A.R.V.I.S</string>
+    <string name="accessibility_service_label">JARVIS Phone Control</string>
+    <string name="accessibility_service_description">Optional on-phone screen reading and navigation helper when you ask JARVIS to perform multi-step app tasks.</string>
+    <string name="notification_listener_label">JARVIS Notification Reader</string>
+    <string name="cd_mic_button">Speak to JARVIS</string>
+    <string name="cd_stop_speaking">Stop speaking or listening</string>
+    <string name="cd_send_message">Send message</string>
+    <string name="cd_attach_image">Attach image from gallery</string>
+    <string name="cd_open_chat">Open conversation</string>
+    <string name="cd_open_memory">Open memory</string>
+    <string name="cd_open_skills">Open skills</string>
+    <string name="cd_open_capabilities">Open capabilities</string>
+    <string name="cd_open_settings">Open settings</string>
+    <string name="cd_open_customize">Customize HUD</string>
+    <string name="cd_open_power">Device and power controls</string>
+    <string name="cd_open_remote">Remote PC and TV</string>
+    <string name="cd_open_tasks">Tasks and activity</string>
+    <string name="cd_open_search">Search commands</string>
+    <string name="cd_close_sheet">Close panel</string>
+    <string name="cd_back">Back</string>
+    <string name="cd_arc_reactor">JARVIS core emblem</string>
+    <string name="cd_qr_code">Generated QR code</string>
+    <string name="cd_generated_image">Generated image</string>
+</resources>

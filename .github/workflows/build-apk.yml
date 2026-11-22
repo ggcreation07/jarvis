@@ -48,12 +48,42 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - name: Restore debug keystore
+      - name: Restore or generate debug keystore
+        env:
+          DEBUG_KEYSTORE_SECRET: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
         run: |
-          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
-            echo "Restoring debug.keystore from base64..."
+          # Priority 1: Restore from GitHub secret DEBUG_KEYSTORE_BASE64 if available
+          if [ -n "$DEBUG_KEYSTORE_SECRET" ]; then
+            echo "Restoring debug.keystore from DEBUG_KEYSTORE_BASE64 secret..."
+            echo "$DEBUG_KEYSTORE_SECRET" | base64 -d > debug.keystore
+          fi
+
+          # Priority 2: Restore from local debug.keystore.base64 if keystore is missing or empty
+          if [ ! -s debug.keystore ] && [ -s debug.keystore.base64 ]; then
+            echo "Restoring debug.keystore from debug.keystore.base64..."
             base64 -d debug.keystore.base64 > debug.keystore
           fi
+
+          # Priority 3: Fallback generation with exact matching credentials if still missing
+          if [ ! -s debug.keystore ]; then
+            echo "Generating fallback debug.keystore matching debugConfig requirements..."
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # Priority 4: Verify that debug.keystore is non-empty and readable
+          if [ ! -s debug.keystore ]; then
+            echo "::error::Failed to provision debug.keystore! ':app:validateSigningDebug' will fail."
+            exit 1
+          fi
+          echo "debug.keystore successfully verified ($(wc -c < debug.keystore) bytes)."
 
       - name: Configure Google Services (Firebase)
         env:

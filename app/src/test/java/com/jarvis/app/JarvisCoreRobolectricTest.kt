@@ -675,6 +675,35 @@ class JarvisCoreRobolectricTest {
     }
 
     @Test
+    fun `voice interaction session keeps UI visible on missing mic permission instead of dismissing`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        Shadows.shadowOf(app).denyPermissions(Manifest.permission.RECORD_AUDIO)
+        val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)
+        runtime.stopAssistant()
+
+        val serviceController = Robolectric.buildService(
+            com.jarvis.app.platform.JarvisVoiceInteractionSessionService::class.java
+        )
+        val sessionService = serviceController.create().get()
+        val session = sessionService.onNewSession(null) as com.jarvis.app.platform.JarvisVoiceInteractionSession
+        try {
+            session.onCreate()
+            session.onPrepareShow(null, 0)
+            session.onShow(null, 0)
+
+            assertTrue("Voice-only UI must remain active even without mic permission so entrance animation is shown", runtime.isVoiceOnlyUiActive.value)
+            assertNotNull("Assistant launch event must be created", runtime.assistantLaunchEvent.value)
+            assertTrue("Banner should prompt for microphone permission", runtime.bannerMessage.value?.contains("permission", ignoreCase = true) == true)
+
+            runtime.stopAssistant()
+        } finally {
+            runtime.stopAssistant()
+            session.onDestroy()
+            serviceController.destroy()
+        }
+    }
+
+    @Test
     fun `voice foreground service posts ongoing notification with Stop Assistant action and handles mic permission`() {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)

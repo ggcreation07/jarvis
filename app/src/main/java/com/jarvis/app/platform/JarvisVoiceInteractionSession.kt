@@ -2,9 +2,12 @@ package com.jarvis.app.platform
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.service.voice.VoiceInteractionSession
 import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.ComposeView
@@ -102,6 +105,21 @@ class JarvisVoiceInteractionSession(
         }
     }
 
+    override fun onPrepareShow(args: Bundle?, showFlags: Int) {
+        super.onPrepareShow(args, showFlags)
+        runCatching {
+            window?.window?.let { win ->
+                win.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                win.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
+                win.addFlags(
+                    WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                )
+            }
+        }
+    }
+
     override fun onShow(args: Bundle?, showFlags: Int) {
         super.onShow(args, showFlags)
         attachWindowTreeOwners()
@@ -113,17 +131,18 @@ class JarvisVoiceInteractionSession(
             onFinish = { runCatching { finish() } }
         )
 
-        if (!runtime.hasRecordAudioPermission()) {
-            launchPermissionHostActivity()
-            return
-        }
-
+        // Always activate voice-only UI and trigger entrance animation so the assistant UI is visible
         if (runtime.activateVoiceOnlyUi(AssistantLaunchIntentHelper.ACTION_VOICE_INTERACTION_SESSION)) {
             runtime.assistantLaunchEvent.value?.let { ev ->
                 runtime.markAssistantVoiceTriggered(ev.launchId)
             }
         }
-        runtime.startAssistantListeningIfIdle(startForegroundServiceIfPermitted = true)
+
+        if (runtime.hasRecordAudioPermission()) {
+            runtime.startAssistantListeningIfIdle(startForegroundServiceIfPermitted = true)
+        } else {
+            runtime.showBanner("Microphone permission needed. Tap the orb to grant.")
+        }
     }
 
     override fun onHide() {

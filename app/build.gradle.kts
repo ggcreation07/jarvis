@@ -56,6 +56,12 @@ android {
     testOptions {
         unitTests.isIncludeAndroidResources = true
     }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
@@ -91,7 +97,6 @@ dependencies {
     implementation(libs.mediapipe.tasks.vision)
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.ai)
-    implementation(libs.firebase.appcheck.recaptcha)
     implementation(libs.firebase.appcheck.debug)
 
     testImplementation(libs.junit)

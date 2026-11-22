@@ -229,4 +229,6 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     fun openNotificationListenerSettings() = runtime.openNotificationListenerSettings()
 
     fun openAccessibilitySettings() = runtime.openAccessibilitySettings()
+
+    fun openDefaultAssistantSettings() = runtime.openDefaultAssistantSettings()
 }

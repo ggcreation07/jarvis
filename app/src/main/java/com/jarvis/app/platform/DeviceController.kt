@@ -160,6 +160,23 @@ class DeviceController(private val context: Context) {
         }
     }
 
+    fun openDefaultAssistantSettings(): ActionOutcome {
+        return try {
+            // ACTION_VOICE_ASSIST_SETTINGS or ACTION_MANAGE_DEFAULT_APPS_SETTINGS
+            val intent = Intent(Settings.ACTION_VOICE_INPUT_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            ActionOutcome(true, "Opened Default Assistant settings.")
+        } catch (_: Exception) {
+            try {
+                val fallback = Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(fallback)
+                ActionOutcome(true, "Opened Default Apps settings.")
+            } catch (e: Exception) {
+                ActionOutcome(false, "Couldn't open Default Assistant settings: ${e.message}")
+            }
+        }
+    }
+
     fun setTimer(seconds: Int, label: String = ""): ActionOutcome {
         if (seconds <= 0) return ActionOutcome(false, "Timer length must be at least 1 second.")
         return try {

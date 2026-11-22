@@ -967,6 +967,10 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         deviceController.openSettingsScreen(Settings.ACTION_ACCESSIBILITY_SETTINGS)
     }
 
+    fun openDefaultAssistantSettings() {
+        deviceController.openDefaultAssistantSettings()
+    }
+
     companion object {
         @Volatile
         private var INSTANCE: JarvisAssistantRuntime? = null

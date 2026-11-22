@@ -224,9 +224,38 @@ fun SettingsSheet(
 
                 if (matches("Voice Speech Microphone TTS Mute Wake")) {
                     item {
-                        SectionCard("Voice & Audio") {
+                        SectionCard("Voice & Audio & Permissions") {
+                            val hasMic = remember(telemetry) {
+                                android.content.pm.PackageManager.PERMISSION_GRANTED == androidx.core.content.ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.RECORD_AUDIO
+                                )
+                            }
                             Text(
-                                "Speech recognition: ${if (viewModel.voiceController.isSpeechRecognitionAvailable()) "Available" else "Unavailable on device"}",
+                                text = "Microphone Permission: ${if (hasMic) "Granted" else "Not Granted"}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (hasMic) hud.success else hud.danger
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                if (!hasMic) {
+                                    Button(
+                                        onClick = { micPermLauncher.launch(Manifest.permission.RECORD_AUDIO) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = hud.accent, contentColor = hud.background)
+                                    ) {
+                                        Text("Request Mic")
+                                    }
+                                } else {
+                                    OutlinedButton(onClick = { micPermLauncher.launch(Manifest.permission.RECORD_AUDIO) }) {
+                                        Text("Re-request Mic")
+                                    }
+                                }
+                                OutlinedButton(onClick = { viewModel.openDefaultAssistantSettings() }) {
+                                    Text("Default Assistant Settings")
+                                }
+                            }
+
+                            Text(
+                                text = "Speech recognition: ${if (viewModel.voiceController.isSpeechRecognitionAvailable()) "Available" else "Unavailable on device"}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = hud.textSecondary
                             )
@@ -252,9 +281,6 @@ fun SettingsSheet(
                                 colors = SliderDefaults.colors(thumbColor = hud.accent, activeTrackColor = hud.accent)
                             )
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                OutlinedButton(onClick = { micPermLauncher.launch(Manifest.permission.RECORD_AUDIO) }) {
-                                    Text("Mic Permission")
-                                }
                                 OutlinedButton(onClick = { viewModel.voiceController.speak("J.A.R.V.I.S voice systems online.") }) {
                                     Text("Test Speech")
                                 }
@@ -272,20 +298,39 @@ fun SettingsSheet(
                                 }
                             }
                             Text(
-                                "Notification Reader: ${if (notificationEnabled) "Enabled" else "Not enabled"}",
+                                text = "Notification Reader: ${if (notificationEnabled) "Granted" else "Not Granted"}",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = if (notificationEnabled) hud.success else hud.textSecondary
+                                color = if (notificationEnabled) hud.success else hud.danger
                             )
-                            OutlinedButton(onClick = { viewModel.openNotificationListenerSettings() }) {
-                                Text("Open Notification Access Settings")
+                            if (!notificationEnabled) {
+                                Button(
+                                    onClick = { viewModel.openNotificationListenerSettings() },
+                                    colors = ButtonDefaults.buttonColors(containerColor = hud.accent, contentColor = hud.background)
+                                ) {
+                                    Text("Open Notification Settings")
+                                }
+                            } else {
+                                OutlinedButton(onClick = { viewModel.openNotificationListenerSettings() }) {
+                                    Text("Open Notification Settings")
+                                }
                             }
+
                             Text(
-                                "Accessibility Phone Control: ${if (accessibilityEnabled) "Enabled" else "Not enabled"}",
+                                text = "Accessibility Phone Control: ${if (accessibilityEnabled) "Granted" else "Not Granted"}",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = if (accessibilityEnabled) hud.success else hud.textSecondary
+                                color = if (accessibilityEnabled) hud.success else hud.danger
                             )
-                            OutlinedButton(onClick = { viewModel.openAccessibilitySettings() }) {
-                                Text("Open Accessibility Settings")
+                            if (!accessibilityEnabled) {
+                                Button(
+                                    onClick = { viewModel.openAccessibilitySettings() },
+                                    colors = ButtonDefaults.buttonColors(containerColor = hud.accent, contentColor = hud.background)
+                                ) {
+                                    Text("Open Accessibility Settings")
+                                }
+                            } else {
+                                OutlinedButton(onClick = { viewModel.openAccessibilitySettings() }) {
+                                    Text("Open Accessibility Settings")
+                                }
                             }
                         }
                     }

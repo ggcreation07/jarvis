@@ -25,6 +25,7 @@ enum class OverlayType {
     DEVICE_POWER,
     COMMAND_PALETTE,
     TASKS_ACTIVITY,
+    ROUTINES,
     QUICK_START
 }
 

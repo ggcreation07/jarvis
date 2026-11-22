@@ -43,18 +43,18 @@ data class JarvisHudColors(
 
 val LocalJarvisColors = staticCompositionLocalOf {
     JarvisHudColors(
-        background = Color(0xFF04070D),
-        surfacePanel = Color(0xFF0A111D),
-        surfaceCard = Color(0xFF0E1728),
-        accent = Color(0xFF00E5FF),
-        secondaryAccent = Color(0xFF3B82F6),
-        borderSubtle = Color(0x3300E5FF),
-        textPrimary = Color(0xFFEAF4FF),
-        textSecondary = Color(0xFF8CA3BF),
+        background = Color(0xFF0B0D12),
+        surfacePanel = Color(0xFF151821),
+        surfaceCard = Color(0xFF151821),
+        accent = Color(0xFF38BDF8),
+        secondaryAccent = Color(0xFF60A5FA),
+        borderSubtle = Color(0xFF242936),
+        textPrimary = Color(0xFFF3F5F8),
+        textSecondary = Color(0xFF9AA3B2),
         success = Color(0xFF34D399),
         warning = Color(0xFFFBBF24),
         danger = Color(0xFFF87171),
-        glowAlpha = 0.65f,
+        glowAlpha = 0f,
         isHudLook = false,
         cornerRadiusDp = 16
     )
@@ -79,67 +79,63 @@ fun JarvisTheme(
     screenConfig: ScreenConfig,
     content: @Composable () -> Unit
 ) {
-    val accent = parseHexColor(screenConfig.mainHex, Color(0xFF00E5FF))
-    val secondary = parseHexColor(screenConfig.secondHex, Color(0xFF3B82F6))
-    val isHud = screenConfig.look == "ironman" || screenConfig.fontStyle == "hud"
-    val glowFactor = (screenConfig.glowStrength.coerceIn(0, 100) / 100f)
+    val accent = Color(0xFF38BDF8)
+    val secondary = Color(0xFF60A5FA)
 
     val hudColors = JarvisHudColors(
-        background = Color(0xFF04070D),
-        surfacePanel = Color(0xFF0A111D),
-        surfaceCard = if (screenConfig.cardStyle == "hud") Color(0xCC091322) else Color(0xE60D1626),
+        background = Color(0xFF0B0D12),
+        surfacePanel = Color(0xFF151821),
+        surfaceCard = Color(0xFF151821),
         accent = accent,
         secondaryAccent = secondary,
-        borderSubtle = accent.copy(alpha = 0.16f + 0.18f * glowFactor),
-        textPrimary = Color(0xFFEBF5FF),
-        textSecondary = Color(0xFF8AA2BE),
+        borderSubtle = Color(0xFF242936),
+        textPrimary = Color(0xFFF3F5F8),
+        textSecondary = Color(0xFF9AA3B2),
         success = Color(0xFF34D399),
         warning = Color(0xFFFBBF24),
         danger = Color(0xFFF87171),
-        glowAlpha = glowFactor,
-        isHudLook = isHud,
-        cornerRadiusDp = screenConfig.cornerRadiusDp.coerceIn(4, 24)
+        glowAlpha = 0f,
+        isHudLook = false,
+        cornerRadiusDp = screenConfig.cornerRadiusDp.coerceIn(10, 24)
     )
 
     val colorScheme = darkColorScheme(
         primary = accent,
-        onPrimary = Color(0xFF031018),
-        primaryContainer = accent.copy(alpha = 0.18f),
-        onPrimaryContainer = accent,
+        onPrimary = Color(0xFF0B0D12),
+        primaryContainer = Color(0xFF1E2533),
+        onPrimaryContainer = Color(0xFFF3F5F8),
         secondary = secondary,
-        onSecondary = Color.White,
-        secondaryContainer = secondary.copy(alpha = 0.18f),
-        onSecondaryContainer = Color(0xFFE2EEFF),
+        onSecondary = Color(0xFF0B0D12),
+        secondaryContainer = Color(0xFF1E2533),
+        onSecondaryContainer = Color(0xFFF3F5F8),
         background = hudColors.background,
         onBackground = hudColors.textPrimary,
         surface = hudColors.surfacePanel,
         onSurface = hudColors.textPrimary,
-        surfaceVariant = hudColors.surfaceCard,
+        surfaceVariant = Color(0xFF1C202B),
         onSurfaceVariant = hudColors.textSecondary,
         outline = hudColors.borderSubtle,
         error = hudColors.danger,
-        onError = Color.Black
+        onError = Color(0xFF0B0D12)
     )
 
-    val displayFamily = if (isHud) OrbitronFamily else InterFamily
-    val labelFamily = if (screenConfig.fontStyle == "hud") ShareTechMonoFamily else InterFamily
-    val bodyFamily = InterFamily
-
     val typography = Typography(
-        displayLarge = TextStyle(fontFamily = displayFamily, fontWeight = FontWeight.Bold, fontSize = 36.sp, letterSpacing = if (isHud) 2.sp else 0.sp),
-        headlineMedium = TextStyle(fontFamily = displayFamily, fontWeight = FontWeight.SemiBold, fontSize = 22.sp, letterSpacing = if (isHud) 1.4.sp else 0.sp),
-        titleLarge = TextStyle(fontFamily = displayFamily, fontWeight = FontWeight.SemiBold, fontSize = 18.sp),
-        titleMedium = TextStyle(fontFamily = labelFamily, fontWeight = FontWeight.SemiBold, fontSize = 15.sp),
-        bodyLarge = TextStyle(fontFamily = bodyFamily, fontWeight = FontWeight.Normal, fontSize = 15.sp, lineHeight = 22.sp),
-        bodyMedium = TextStyle(fontFamily = bodyFamily, fontWeight = FontWeight.Normal, fontSize = 13.5.sp, lineHeight = 20.sp),
-        labelMedium = TextStyle(fontFamily = labelFamily, fontWeight = FontWeight.Medium, fontSize = 11.5.sp, letterSpacing = 0.7.sp),
-        labelSmall = TextStyle(fontFamily = labelFamily, fontWeight = FontWeight.Medium, fontSize = 10.sp, letterSpacing = 0.8.sp)
+        displayLarge = TextStyle(fontFamily = InterFamily, fontWeight = FontWeight.SemiBold, fontSize = 32.sp, lineHeight = 38.sp),
+        headlineMedium = TextStyle(fontFamily = InterFamily, fontWeight = FontWeight.SemiBold, fontSize = 22.sp, lineHeight = 28.sp),
+        titleLarge = TextStyle(fontFamily = InterFamily, fontWeight = FontWeight.SemiBold, fontSize = 18.sp, lineHeight = 24.sp),
+        titleMedium = TextStyle(fontFamily = InterFamily, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, lineHeight = 22.sp),
+        titleSmall = TextStyle(fontFamily = InterFamily, fontWeight = FontWeight.Medium, fontSize = 14.sp, lineHeight = 20.sp),
+        bodyLarge = TextStyle(fontFamily = InterFamily, fontWeight = FontWeight.Normal, fontSize = 15.5.sp, lineHeight = 23.sp),
+        bodyMedium = TextStyle(fontFamily = InterFamily, fontWeight = FontWeight.Normal, fontSize = 14.5.sp, lineHeight = 21.sp),
+        bodySmall = TextStyle(fontFamily = InterFamily, fontWeight = FontWeight.Normal, fontSize = 13.sp, lineHeight = 18.sp),
+        labelMedium = TextStyle(fontFamily = InterFamily, fontWeight = FontWeight.Medium, fontSize = 12.sp, letterSpacing = 0.2.sp),
+        labelSmall = TextStyle(fontFamily = InterFamily, fontWeight = FontWeight.Medium, fontSize = 11.sp, letterSpacing = 0.2.sp)
     )
 
     val r = hudColors.cornerRadiusDp.dp
     val shapes = Shapes(
         extraSmall = RoundedCornerShape((r * 0.4f).coerceAtLeast(4.dp)),
-        small = RoundedCornerShape((r * 0.65f).coerceAtLeast(6.dp)),
+        small = RoundedCornerShape((r * 0.65f).coerceAtLeast(8.dp)),
         medium = RoundedCornerShape(r),
         large = RoundedCornerShape((r * 1.25f).coerceAtMost(28.dp)),
         extraLarge = RoundedCornerShape(28.dp)

@@ -13,7 +13,12 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-class SecureSecretStore(context: Context) {
+interface SecretStorage {
+    suspend fun setSecret(key: String, value: String): Boolean
+    suspend fun getSecret(key: String): String
+}
+
+class SecureSecretStore(context: Context) : SecretStorage {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val lock = Any()
 
@@ -32,6 +37,7 @@ class SecureSecretStore(context: Context) {
         const val KEY_MISTRAL = "mistral_api_key"
         const val KEY_TAVILY = "tavily_api_key"
         const val KEY_PC_SECRET = "pc_shared_secret"
+        const val KEY_TRUSTED_PC_HOSTS = "trusted_pc_hosts_json"
     }
 
     private fun secretKey(): SecretKey = synchronized(lock) {
@@ -74,7 +80,7 @@ class SecureSecretStore(context: Context) {
         return String(plain, StandardCharsets.UTF_8)
     }
 
-    suspend fun setSecret(key: String, value: String) = withContext(Dispatchers.IO) {
+    override suspend fun setSecret(key: String, value: String) = withContext(Dispatchers.IO) {
         val trimmed = value.trim()
         synchronized(lock) {
             if (trimmed.isEmpty()) {
@@ -85,7 +91,7 @@ class SecureSecretStore(context: Context) {
         }
     }
 
-    suspend fun getSecret(key: String): String = withContext(Dispatchers.IO) {
+    override suspend fun getSecret(key: String): String = withContext(Dispatchers.IO) {
         synchronized(lock) {
             val raw = prefs.getString(key, null) ?: return@withContext ""
             try {

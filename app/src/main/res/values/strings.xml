@@ -24,4 +24,17 @@
     <string name="cd_arc_reactor">JARVIS core emblem</string>
     <string name="cd_qr_code">Generated QR code</string>
     <string name="cd_generated_image">Generated image</string>
+    <string name="cd_open_sidebar">Open navigation sidebar</string>
+    <string name="cd_new_chat">Start new chat</string>
+    <string name="cd_voice_mode">Toggle voice mode</string>
+    <string name="cd_agent_mode_picker">Select agent and conversation mode</string>
+    <string name="cd_orb_placeholder">JARVIS assistant orb</string>
+    <string name="voice_service_label">JARVIS Digital Assistant</string>
+    <string name="voice_notif_channel_name">JARVIS Voice Session</string>
+    <string name="voice_notif_title">JARVIS Voice Assistant</string>
+    <string name="voice_notif_listening">Listening in background…</string>
+    <string name="voice_notif_thinking">Thinking…</string>
+    <string name="voice_notif_speaking">Speaking response…</string>
+    <string name="voice_notif_ready">Voice session active</string>
+    <string name="action_stop_assistant">Stop Assistant</string>
 </resources>

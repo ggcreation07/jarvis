@@ -55,6 +55,31 @@ jobs:
             base64 -d debug.keystore.base64 > debug.keystore
           fi
 
+      - name: Configure Google Services (Firebase)
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          mkdir -p app
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            echo "Provisioning app/google-services.json from GOOGLE_SERVICES_JSON secret..."
+            if echo "$GOOGLE_SERVICES_JSON" | base64 -d >/dev/null 2>&1 && [[ "$GOOGLE_SERVICES_JSON" != *"{"* ]]; then
+              echo "$GOOGLE_SERVICES_JSON" | base64 -d > app/google-services.json
+            else
+              echo "$GOOGLE_SERVICES_JSON" > app/google-services.json
+            fi
+            echo "Successfully generated app/google-services.json from secret."
+          elif [ -f "app/google-services.json" ]; then
+            echo "Using existing app/google-services.json found in repository."
+          else
+            echo "::error::Missing 'GOOGLE_SERVICES_JSON' secret! Firebase is required by JARVIS for Firebase AI Logic and App Check. Please configure the 'GOOGLE_SERVICES_JSON' repository secret in GitHub Settings (Settings -> Secrets and variables -> Actions) with your google-services.json content."
+            exit 1
+          fi
+
+          if [ ! -s "app/google-services.json" ]; then
+            echo "::error::app/google-services.json is empty or invalid!"
+            exit 1
+          fi
+
       - name: Grant execute permission for gradlew
         run: |
           if [ -f "./gradlew" ]; then

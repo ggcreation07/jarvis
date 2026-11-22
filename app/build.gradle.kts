@@ -66,6 +66,7 @@ android {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.fragment)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
@@ -97,7 +98,9 @@ dependencies {
     implementation(libs.mediapipe.tasks.vision)
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.ai)
-    implementation(libs.firebase.appcheck.debug)
+    implementation(libs.firebase.appcheck)
+    debugImplementation(libs.firebase.appcheck.debug)
+    releaseImplementation(libs.firebase.appcheck.recaptcha)
 
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)

@@ -43,8 +43,124 @@ class ToolExecutor(
     private val deviceController: DeviceController,
     private val firebaseAiService: FirebaseAiService,
     private val remotePcClient: RemotePcClient,
-    private val tvControlClient: TvControlClient
+    private val tvControlClient: TvControlClient,
+    private val nowMs: () -> Long = { System.currentTimeMillis() },
+    private val confirmationTimeoutMs: Long = ToolConfirmationPolicy.DEFAULT_CONFIRMATION_TIMEOUT_MS
 ) {
+    private class ConfirmedGrant(
+        val binding: ActionBindingKey,
+        val expiresAtMs: Long
+    ) {
+        var consumed: Boolean = false
+    }
+
+    private val confirmationLock = Any()
+    private var pendingConfirmation: PendingProtectedAction? = null
+    private var nextConfirmationSeq: Long = 1L
+
+    private fun pruneExpiredLocked(now: Long) {
+        pendingConfirmation?.let {
+            if (now > it.expiresAtMs) pendingConfirmation = null
+        }
+    }
+
+    fun getPendingConfirmation(): PendingProtectedAction? = synchronized(confirmationLock) {
+        pendingConfirmation?.takeIf { nowMs() <= it.expiresAtMs }
+    }
+
+    fun clearPendingConfirmation() {
+        synchronized(confirmationLock) {
+            pendingConfirmation = null
+        }
+    }
+
+    suspend fun handleConfirmationInput(
+        rawInput: String,
+        onSideEffect: suspend (ToolSideEffects) -> Unit
+    ): ConfirmationTurnOutcome {
+        val current: PendingProtectedAction
+        val isExpired: Boolean
+        synchronized(confirmationLock) {
+            val now = nowMs()
+            val pending = pendingConfirmation
+            if (pending == null) {
+                return ConfirmationTurnOutcome.None
+            }
+            current = pending
+            isExpired = now > pending.expiresAtMs
+            if (isExpired) {
+                pendingConfirmation = null
+            }
+        }
+
+        val intent = ConfirmationClassifier.classify(rawInput)
+        if (isExpired) {
+            return when (intent) {
+                ConfirmationIntent.CANCEL -> ConfirmationTurnOutcome.Cancelled(
+                    actionDescription = current.description,
+                    replyText = ToolConfirmationPolicy.buildCancelledReply(current.description, rawInput)
+                )
+                ConfirmationIntent.AFFIRM, ConfirmationIntent.AMBIGUOUS -> ConfirmationTurnOutcome.Expired(
+                    actionDescription = current.description,
+                    replyText = ToolConfirmationPolicy.buildExpiredReply(current.description, rawInput)
+                )
+                ConfirmationIntent.UNRELATED -> ConfirmationTurnOutcome.None
+            }
+        }
+
+        return when (intent) {
+            ConfirmationIntent.CANCEL -> {
+                clearPendingConfirmation()
+                repository.logAction(
+                    current.binding.toolName,
+                    "Confirmation cancelled: ${current.description}",
+                    false
+                )
+                ConfirmationTurnOutcome.Cancelled(
+                    actionDescription = current.description,
+                    replyText = ToolConfirmationPolicy.buildCancelledReply(current.description, rawInput)
+                )
+            }
+            ConfirmationIntent.AMBIGUOUS -> {
+                ConfirmationTurnOutcome.NeedsClarification(
+                    actionDescription = current.description,
+                    replyText = ToolConfirmationPolicy.buildClarificationPrompt(current.description, rawInput)
+                )
+            }
+            ConfirmationIntent.UNRELATED -> {
+                clearPendingConfirmation()
+                ConfirmationTurnOutcome.None
+            }
+            ConfirmationIntent.AFFIRM -> {
+                val pair = synchronized(confirmationLock) {
+                    val now = nowMs()
+                    val latest = pendingConfirmation
+                    if (latest == null || latest.id != current.id || now > latest.expiresAtMs) {
+                        pendingConfirmation = null
+                        null
+                    } else {
+                        pendingConfirmation = null
+                        latest to ConfirmedGrant(latest.binding, latest.expiresAtMs)
+                    }
+                }
+                if (pair == null) {
+                    return ConfirmationTurnOutcome.Expired(
+                        actionDescription = current.description,
+                        replyText = ToolConfirmationPolicy.buildExpiredReply(current.description, rawInput)
+                    )
+                }
+                val (boundAction, scopedGrant) = pair
+                val result = executeInternal(
+                    toolName = boundAction.binding.toolName,
+                    args = boundAction.originalArgs,
+                    onSideEffect = onSideEffect,
+                    authorizedGrant = scopedGrant
+                )
+                ConfirmationTurnOutcome.Executed(boundAction, result)
+            }
+        }
+    }
+
     private fun strArg(args: Map<String, JsonElement>, key: String): String =
         (args[key] as? JsonPrimitive)?.content?.trim().orEmpty()
 
@@ -55,8 +171,65 @@ class ToolExecutor(
         toolName: String,
         args: Map<String, JsonElement>,
         onSideEffect: suspend (ToolSideEffects) -> Unit
+    ): ToolCallExecutionResult = executeInternal(
+        toolName = toolName,
+        args = args,
+        onSideEffect = onSideEffect,
+        authorizedGrant = null
+    )
+
+    private suspend fun executeInternal(
+        toolName: String,
+        args: Map<String, JsonElement>,
+        onSideEffect: suspend (ToolSideEffects) -> Unit,
+        authorizedGrant: ConfirmedGrant?
     ): ToolCallExecutionResult {
-        val result = when (toolName) {
+        val normalizedName = toolName.trim()
+        if (ToolConfirmationPolicy.requiresConfirmation(normalizedName, args)) {
+            val binding = ActionBindingKey(
+                toolName = normalizedName,
+                canonicalArgs = ToolConfirmationPolicy.canonicalizeArgs(normalizedName, args)
+            )
+            var blockedId = ""
+            var blockedDescription = ""
+            var blockedSummary: String? = null
+            synchronized(confirmationLock) {
+                val now = nowMs()
+                pruneExpiredLocked(now)
+                val grantValid = authorizedGrant != null &&
+                    !authorizedGrant.consumed &&
+                    authorizedGrant.binding == binding &&
+                    now <= authorizedGrant.expiresAtMs
+                if (grantValid) {
+                    authorizedGrant!!.consumed = true
+                    pendingConfirmation = null
+                } else {
+                    val id = "confirm_${nextConfirmationSeq++}"
+                    val description = ToolConfirmationPolicy.describeProtectedAction(normalizedName, args)
+                    pendingConfirmation = PendingProtectedAction(
+                        id = id,
+                        binding = binding,
+                        description = description,
+                        originalArgs = args.toMap(),
+                        createdAtMs = now,
+                        expiresAtMs = now + confirmationTimeoutMs
+                    )
+                    blockedId = id
+                    blockedDescription = description
+                    blockedSummary = ToolConfirmationPolicy.buildConfirmationPrompt(description)
+                }
+            }
+            if (blockedSummary != null) {
+                repository.logAction(normalizedName, "Confirmation required: $blockedDescription", false)
+                return confirmationRequired(normalizedName, blockedId, blockedDescription, blockedSummary)
+            }
+        } else {
+            synchronized(confirmationLock) {
+                pruneExpiredLocked(nowMs())
+            }
+        }
+
+        val result = when (normalizedName) {
             "get_time" -> {
                 val now = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date())
                 ok("get_time", "It's $now.")
@@ -408,5 +581,22 @@ class ToolExecutor(
         ok = false,
         summary = summary,
         payload = buildJsonObject { put("status", "failed") }
+    )
+
+    private fun confirmationRequired(
+        tool: String,
+        pendingId: String,
+        description: String,
+        summary: String
+    ) = ToolCallExecutionResult(
+        toolName = tool,
+        ok = false,
+        summary = summary,
+        payload = buildJsonObject {
+            put("status", ToolConfirmationPolicy.STATUS_CONFIRMATION_REQUIRED)
+            put("requires_confirmation", true)
+            put("pending_id", pendingId)
+            put("action", description)
+        }
     )
 }

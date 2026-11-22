@@ -39,11 +39,13 @@ import com.jarvis.app.domain.model.TaskRecordItem
 import com.jarvis.app.domain.model.TelemetrySnapshot
 import com.jarvis.app.domain.model.ToolActivityItem
 import com.jarvis.app.domain.model.WeatherSnapshot
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -230,6 +232,24 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     private var activeTurnJob: Job? = null
     private var followUpListenJob: Job? = null
 
+    @Volatile
+    private var lastTurnInitiatedByVoice: Boolean = false
+
+    @Volatile
+    private var allowAutoFollowUpForCurrentTurn: Boolean = true
+
+    private var consecutiveVoiceErrors: Int = 0
+
+    internal var turnExecutorOverride: (
+        (
+            rawUserInput: String,
+            attachedBitmap: Bitmap?,
+            history: List<ChatMessageItem>,
+            brainConfig: BrainConfig,
+            isVoiceTurn: Boolean
+        ) -> Flow<TurnProgressEvent>
+    )? = null
+
     init {
         runtimeScope.launch {
             val (savedText, savedPage) = configStore.loadReadingSession()
@@ -254,34 +274,56 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
                 refreshServiceStatus()
             }
         }
-        // When TTS finishes a spoken reply during an active continuous voice session,
-        // re-arm listening cleanly after a brief pause so Siri-style hands-free dialogue continues
-        // in foreground or background without looping on silence/no-match errors.
+        // Only re-arm listening when TTS completes an utterance naturally (onDone), never when
+        // interrupted by voice barge-in or stopped manually via Stop/Mute.
         runtimeScope.launch {
-            var wasSpeaking = false
+            voiceController.ttsNaturalCompletions.collect {
+                followUpListenJob?.cancel()
+                if (_isVoiceSessionActive.value && !brainConfig.value.muted && allowAutoFollowUpForCurrentTurn) {
+                    scheduleFollowUpListening()
+                }
+            }
+        }
+        runtimeScope.launch {
+            voiceController.ttsSpeechFailures.collect {
+                followUpListenJob?.cancel()
+                if (_isVoiceSessionActive.value || lastTurnInitiatedByVoice) {
+                    _bannerMessage.value = voiceController.voiceError.value ?: "Voice playback interrupted."
+                }
+                if (_isVoiceSessionActive.value && !brainConfig.value.muted && allowAutoFollowUpForCurrentTurn) {
+                    scheduleFollowUpListening()
+                }
+            }
+        }
+        runtimeScope.launch {
             voiceController.isSpeaking.collect { speaking ->
-                if (wasSpeaking && !speaking) {
-                    followUpListenJob?.cancel()
-                    if (_isVoiceSessionActive.value && !brainConfig.value.muted) {
-                        followUpListenJob = runtimeScope.launch {
-                            delay(420L)
-                            if (_isVoiceSessionActive.value &&
-                                !_isBusy.value &&
-                                !voiceController.isListening.value &&
-                                !voiceController.isSpeaking.value &&
-                                hasRecordAudioPermission()
-                            ) {
-                                startAssistantListeningIfIdle(startForegroundServiceIfPermitted = false)
-                            }
-                        }
-                    }
-                } else if (speaking) {
+                if (speaking) {
                     followUpListenJob?.cancel()
                 }
-                wasSpeaking = speaking
             }
         }
     }
+
+    private fun scheduleFollowUpListening(delayMs: Long = 420L) {
+        followUpListenJob?.cancel()
+        if (!_isVoiceSessionActive.value || brainConfig.value.muted) return
+        followUpListenJob = runtimeScope.launch {
+            delay(delayMs)
+            followUpListenJob = null
+            if (_isVoiceSessionActive.value &&
+                !_isBusy.value &&
+                !voiceController.isListeningOrPending() &&
+                !voiceController.isSpeaking.value &&
+                hasRecordAudioPermission()
+            ) {
+                startAssistantListeningIfIdle(startForegroundServiceIfPermitted = false)
+            }
+        }
+    }
+
+    internal fun isLastTurnInitiatedByVoiceForTest(): Boolean = lastTurnInitiatedByVoice
+    internal fun isAutoFollowUpAllowedForTest(): Boolean = allowAutoFollowUpForCurrentTurn
+    internal fun isTurnActiveForTest(): Boolean = activeTurnJob?.isActive == true
 
     fun hasRecordAudioPermission(): Boolean =
         ContextCompat.checkSelfPermission(
@@ -387,7 +429,11 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         }
     }
 
-    fun sendUserMessage(text: String, openChatIfHome: Boolean = false) {
+    fun sendUserMessage(
+        text: String,
+        openChatIfHome: Boolean = false,
+        initiatedByVoice: Boolean = false
+    ) {
         val trimmed = text.trim()
         val attached = _attachedImage.value
         if (trimmed.isEmpty() && attached == null) return
@@ -398,119 +444,303 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
             _activeOverlay.value = OverlayType.NONE
         }
 
+        lastTurnInitiatedByVoice = initiatedByVoice
         followUpListenJob?.cancel()
         activeTurnJob?.cancel()
         activeTurnJob = runtimeScope.launch {
-            _isBusy.value = true
-            val cfg = brainConfig.value
-            val userMsg = ChatMessageItem(
-                role = "user",
-                content = finalPrompt,
-                agentId = cfg.selectedAgentId,
-                attachmentLabel = attached?.first.orEmpty()
-            )
-            repository.addTurn(userMsg)
+            var nextPrompt: String? = finalPrompt
+            var nextAttached: Pair<String, Bitmap>? = attached
+            var depth = 0
+            while (nextPrompt != null) {
+                val queuedRoutine = executeSingleTurn(
+                    prompt = nextPrompt,
+                    attached = nextAttached,
+                    initiatedByVoice = initiatedByVoice,
+                    canChainRoutine = depth < MAX_ROUTINE_CHAIN_DEPTH
+                )
+                nextPrompt = queuedRoutine?.takeIf { it.isNotBlank() }
+                nextAttached = null
+                depth += 1
+            }
+        }
+    }
+
+    private suspend fun executeSingleTurn(
+        prompt: String,
+        attached: Pair<String, Bitmap>?,
+        initiatedByVoice: Boolean,
+        canChainRoutine: Boolean
+    ): String? {
+        _isBusy.value = true
+        val cfg = brainConfig.value
+        val userMsg = ChatMessageItem(
+            role = "user",
+            content = prompt,
+            agentId = cfg.selectedAgentId,
+            attachmentLabel = attached?.first.orEmpty()
+        )
+        repository.addTurn(userMsg)
+        if (attached != null) {
             _attachedImage.value = null
+        }
 
-            val history = repository.getCurrentTurnsOnce().dropLast(1)
-            var latestActivities: List<ToolActivityItem> = emptyList()
-            var activeAgent = cfg.selectedAgentId
-            var generatedImgKey = ""
-            var generatedQrText = ""
+        val history = repository.getCurrentTurnsOnce().dropLast(1)
+        var latestActivities: List<ToolActivityItem> = emptyList()
+        var activeAgent = cfg.selectedAgentId
+        var generatedImgKey = ""
+        var generatedQrText = ""
+        var pendingRoutinePrompt: String? = null
+        var turnFinished = false
 
-            _streamingMessage.value = ChatMessageItem(
-                role = "assistant",
-                content = "",
-                agentId = activeAgent,
-                isStreaming = true
-            )
+        _streamingMessage.value = ChatMessageItem(
+            role = "assistant",
+            content = "",
+            agentId = activeAgent,
+            isStreaming = true
+        )
 
-            try {
-                orchestrator.executeTurn(
-                    rawUserInput = finalPrompt,
-                    attachedBitmap = attached?.second,
-                    history = history,
-                    brainConfig = cfg
-                ).collect { event ->
-                    when (event) {
-                        is TurnProgressEvent.AgentSelected -> {
-                            activeAgent = event.agentId
-                            _streamingMessage.value = _streamingMessage.value?.copy(agentId = activeAgent)
+        val turnFlow = turnExecutorOverride?.invoke(
+            prompt,
+            attached?.second,
+            history,
+            cfg,
+            initiatedByVoice
+        ) ?: orchestrator.executeTurn(
+            rawUserInput = prompt,
+            attachedBitmap = attached?.second,
+            history = history,
+            brainConfig = cfg,
+            isVoiceTurn = initiatedByVoice
+        )
+
+        try {
+            turnFlow.collect { event ->
+                when (event) {
+                    is TurnProgressEvent.AgentSelected -> {
+                        activeAgent = event.agentId
+                        _streamingMessage.value = _streamingMessage.value?.copy(agentId = activeAgent)
+                    }
+                    is TurnProgressEvent.ToolActivitiesUpdated -> {
+                        latestActivities = event.activities
+                        _streamingMessage.value = _streamingMessage.value?.copy(toolActivities = latestActivities)
+                    }
+                    is TurnProgressEvent.StreamingText -> {
+                        _streamingMessage.value = _streamingMessage.value?.copy(content = event.text)
+                    }
+                    is TurnProgressEvent.SideEffect -> {
+                        val eff = event.effect
+                        eff.openOverlay?.let { _activeOverlay.value = it }
+                        if (eff.clearChat) repository.clearCurrentChatWithoutArchiving()
+                        eff.generatedBitmap?.let { bmp ->
+                            val key = "img_${System.currentTimeMillis()}"
+                            generatedImgKey = key
+                            _generatedBitmaps.value = _generatedBitmaps.value + (key to bmp)
                         }
-                        is TurnProgressEvent.ToolActivitiesUpdated -> {
-                            latestActivities = event.activities
-                            _streamingMessage.value = _streamingMessage.value?.copy(toolActivities = latestActivities)
+                        eff.qrBitmap?.let { bmp ->
+                            val key = "qr_${System.currentTimeMillis()}"
+                            generatedImgKey = key
+                            generatedQrText = eff.qrText
+                            _generatedBitmaps.value = _generatedBitmaps.value + (key to bmp)
                         }
-                        is TurnProgressEvent.StreamingText -> {
-                            _streamingMessage.value = _streamingMessage.value?.copy(content = event.text)
-                        }
-                        is TurnProgressEvent.SideEffect -> {
-                            val eff = event.effect
-                            eff.openOverlay?.let { _activeOverlay.value = it }
-                            if (eff.clearChat) repository.clearCurrentChatWithoutArchiving()
-                            eff.generatedBitmap?.let { bmp ->
-                                val key = "img_${System.currentTimeMillis()}"
-                                generatedImgKey = key
-                                _generatedBitmaps.value = _generatedBitmaps.value + (key to bmp)
-                            }
-                            eff.qrBitmap?.let { bmp ->
-                                val key = "qr_${System.currentTimeMillis()}"
-                                generatedImgKey = key
-                                generatedQrText = eff.qrText
-                                _generatedBitmaps.value = _generatedBitmaps.value + (key to bmp)
-                            }
-                            eff.runRoutinePrompt?.let { rPrompt ->
-                                runtimeScope.launch { sendUserMessage(rPrompt, openChatIfHome = false) }
-                            }
-                        }
-                        is TurnProgressEvent.Finished -> {
-                            _streamingMessage.value = null
-                            _isBusy.value = false
-                            val finalMsg = ChatMessageItem(
-                                role = "assistant",
-                                content = event.replyText,
-                                agentId = event.agentId,
-                                toolActivities = event.activities,
-                                generatedImageKey = generatedImgKey,
-                                qrText = generatedQrText,
-                                isError = event.isError
-                            )
-                            repository.addTurn(finalMsg)
-                            _quotaSnapshots.value = byoAiClient.allQuotaSnapshots()
-                            if (!event.isError && cfg.voiceTtsEnabled && !cfg.muted) {
-                                voiceController.speak(event.replyText)
+                        eff.runRoutinePrompt?.let { rPrompt ->
+                            if (canChainRoutine && rPrompt.isNotBlank() && pendingRoutinePrompt == null) {
+                                pendingRoutinePrompt = rPrompt.trim()
                             }
                         }
                     }
+                    is TurnProgressEvent.Finished -> {
+                        if (turnFinished) return@collect
+                        turnFinished = true
+                        _streamingMessage.value = null
+                        val willChainRoutine = !event.isError && !pendingRoutinePrompt.isNullOrBlank()
+                        val finalMsg = ChatMessageItem(
+                            role = "assistant",
+                            content = event.replyText,
+                            agentId = event.agentId,
+                            toolActivities = event.activities,
+                            generatedImageKey = generatedImgKey,
+                            qrText = generatedQrText,
+                            isError = event.isError
+                        )
+                        repository.addTurn(finalMsg)
+                        _quotaSnapshots.value = byoAiClient.allQuotaSnapshots()
+
+                        if (!willChainRoutine) {
+                            handleTurnCompletedOutput(
+                                replyText = event.replyText,
+                                isError = event.isError,
+                                initiatedByVoice = initiatedByVoice,
+                                cfg = cfg
+                            )
+                            _isBusy.value = false
+                        } else {
+                            _isBusy.value = true
+                        }
+                    }
                 }
-            } catch (_: Exception) {
-                _streamingMessage.value = null
-                _isBusy.value = false
             }
+
+            if (!turnFinished) {
+                _streamingMessage.value = null
+                handleTurnCompletedOutput(
+                    replyText = "Sorry, I couldn't complete that request. Please try again.",
+                    isError = true,
+                    initiatedByVoice = initiatedByVoice,
+                    cfg = cfg
+                )
+                _isBusy.value = false
+                return null
+            }
+            return pendingRoutinePrompt
+        } catch (e: CancellationException) {
+            _streamingMessage.value = null
+            _isBusy.value = false
+            throw e
+        } catch (e: Exception) {
+            _streamingMessage.value = null
+            val errMsg = e.localizedMessage?.takeIf { it.isNotBlank() }
+                ?: "Sorry, something went wrong while processing that request."
+            runCatching {
+                repository.addTurn(
+                    ChatMessageItem(
+                        role = "assistant",
+                        content = errMsg,
+                        agentId = activeAgent,
+                        toolActivities = latestActivities,
+                        isError = true
+                    )
+                )
+            }
+            handleTurnCompletedOutput(
+                replyText = errMsg,
+                isError = true,
+                initiatedByVoice = initiatedByVoice,
+                cfg = cfg
+            )
+            _isBusy.value = false
+            return null
+        }
+    }
+
+    private fun handleTurnCompletedOutput(
+        replyText: String,
+        isError: Boolean,
+        initiatedByVoice: Boolean,
+        cfg: BrainConfig
+    ) {
+        val isVoiceContext = _isVoiceSessionActive.value || initiatedByVoice
+        if (!isError) {
+            consecutiveVoiceErrors = 0
+            allowAutoFollowUpForCurrentTurn = _isVoiceSessionActive.value && !cfg.muted
+            if (cfg.voiceTtsEnabled && !cfg.muted) {
+                val allowBargeIn = isVoiceContext && hasRecordAudioPermission()
+                val spoke = voiceController.speak(
+                    text = replyText,
+                    enableBargeIn = allowBargeIn,
+                    onBargeInDetected = { handleVoiceBargeIn() }
+                )
+                if (!spoke) {
+                    if (isVoiceContext && (!voiceController.isTtsReady() || voiceController.voiceError.value != null)) {
+                        _bannerMessage.value = voiceController.voiceError.value ?: "Voice playback unavailable."
+                    }
+                    if (_isVoiceSessionActive.value && !cfg.muted) {
+                        scheduleFollowUpListening()
+                    }
+                }
+            } else if (_isVoiceSessionActive.value && !cfg.muted) {
+                scheduleFollowUpListening()
+            }
+            return
+        }
+
+        if (!isVoiceContext) {
+            allowAutoFollowUpForCurrentTurn = false
+            return
+        }
+
+        consecutiveVoiceErrors += 1
+        val canAutoRearm = _isVoiceSessionActive.value &&
+            !cfg.muted &&
+            consecutiveVoiceErrors < MAX_CONSECUTIVE_VOICE_ERRORS
+        allowAutoFollowUpForCurrentTurn = canAutoRearm
+
+        val spokenNotice = buildSpokenErrorNotice(replyText)
+        _bannerMessage.value = spokenNotice
+
+        if (cfg.voiceTtsEnabled && !cfg.muted) {
+            val spoke = voiceController.speak(
+                text = spokenNotice,
+                enableBargeIn = canAutoRearm && hasRecordAudioPermission(),
+                onBargeInDetected = { handleVoiceBargeIn() }
+            )
+            if (!spoke && canAutoRearm) {
+                scheduleFollowUpListening()
+            }
+        } else if (canAutoRearm) {
+            scheduleFollowUpListening()
+        }
+    }
+
+    private fun buildSpokenErrorNotice(rawError: String): String {
+        val cleaned = voiceController.sanitizeTextForSpeech(rawError)
+        val looksTechnical = cleaned.contains("Exception", ignoreCase = true) ||
+            cleaned.contains("stacktrace", ignoreCase = true) ||
+            cleaned.length > 220
+        return if (cleaned.isBlank() || looksTechnical) {
+            "Sorry, I ran into an issue completing that request. Please try again."
+        } else {
+            cleaned
+        }
+    }
+
+    internal fun handleVoiceBargeIn() {
+        followUpListenJob?.cancel()
+        if (brainConfig.value.muted ||
+            !hasRecordAudioPermission() ||
+            _isBusy.value ||
+            voiceController.isListeningOrPending()
+        ) {
+            return
+        }
+        if (_isVoiceSessionActive.value) {
+            startAssistantListeningIfIdle(startForegroundServiceIfPermitted = false)
+        } else if (lastTurnInitiatedByVoice) {
+            voiceController.startListening(
+                onFinalResult = { spoken ->
+                    sendUserMessage(spoken, openChatIfHome = false, initiatedByVoice = true)
+                },
+                onFailure = { msg ->
+                    _bannerMessage.value = msg
+                }
+            )
         }
     }
 
     fun stopCurrentWork() {
         followUpListenJob?.cancel()
         activeTurnJob?.cancel()
+        allowAutoFollowUpForCurrentTurn = false
+        consecutiveVoiceErrors = 0
         _streamingMessage.value = null
         _isBusy.value = false
-        voiceController.stopListening()
+        voiceController.cancelListening()
         voiceController.stopSpeaking()
     }
 
     fun toggleVoiceInput() {
+        followUpListenJob?.cancel()
+        consecutiveVoiceErrors = 0
         if (voiceController.isSpeaking.value) {
             voiceController.stopSpeaking()
             return
         }
-        if (voiceController.isListening.value) {
+        if (voiceController.isListeningOrPending()) {
             voiceController.stopListening()
             return
         }
         voiceController.startListening(
             onFinalResult = { spoken ->
-                sendUserMessage(spoken, openChatIfHome = false)
+                sendUserMessage(spoken, openChatIfHome = false, initiatedByVoice = true)
             },
             onFailure = { msg ->
                 _bannerMessage.value = msg
@@ -524,6 +754,8 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     ): Boolean {
         val accepted = onAssistantActivated(action = action, nowMs = nowMs)
         if (accepted) {
+            consecutiveVoiceErrors = 0
+            allowAutoFollowUpForCurrentTurn = true
             _isVoiceOnlyUiActive.value = true
             _isVoiceSessionActive.value = true
         }
@@ -568,6 +800,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     }
 
     fun startAssistantListeningIfIdle(startForegroundServiceIfPermitted: Boolean = true): Boolean {
+        followUpListenJob?.cancel()
         if (!hasRecordAudioPermission()) {
             _bannerMessage.value = "Microphone permission is needed to listen in background."
             return false
@@ -576,15 +809,15 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         if (startForegroundServiceIfPermitted) {
             VoiceAssistantForegroundService.start(context)
         }
-        if (voiceController.isListening.value) {
+        if (_isBusy.value || voiceController.isListeningOrPending()) {
             return false
         }
         if (voiceController.isSpeaking.value) {
-            voiceController.stopSpeaking()
+            voiceController.stopSpeaking(interruptedByBargeIn = true)
         }
         voiceController.startListening(
             onFinalResult = { spoken ->
-                sendUserMessage(spoken, openChatIfHome = false)
+                sendUserMessage(spoken, openChatIfHome = false, initiatedByVoice = true)
             },
             onFailure = { msg ->
                 _bannerMessage.value = msg
@@ -606,6 +839,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         lastAssistantActivationMs = 0L
         _isVoiceSessionActive.value = false
         _isVoiceOnlyUiActive.value = false
+        toolExecutor.clearPendingConfirmation()
         stopCurrentWork()
         VoiceAssistantForegroundService.stop(context)
         activeVoiceInteractionFinish?.invoke()
@@ -659,6 +893,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     }
 
     fun handleRoutineTap(routineName: String) {
+        toolExecutor.clearPendingConfirmation()
         runtimeScope.launch {
             val match = repository.getRoutinesOnce().firstOrNull { it.name.equals(routineName, true) }
             if (match != null) {
@@ -669,6 +904,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     }
 
     fun startNewChat() {
+        toolExecutor.clearPendingConfirmation()
         runtimeScope.launch { repository.archiveAndClearCurrentChat() }
     }
 
@@ -709,6 +945,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     }
 
     fun runRoutine(item: RoutineItem) {
+        toolExecutor.clearPendingConfirmation()
         runtimeScope.launch {
             repository.upsertRoutine(item.copy(lastRunDate = RoutineAlarms.isoDate(System.currentTimeMillis())))
             sendUserMessage(item.prompt, openChatIfHome = true)
@@ -816,7 +1053,11 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         runtimeScope.launch {
             configStore.updateBrainConfig { cur ->
                 val nextMuted = !cur.muted
-                if (nextMuted) voiceController.stopSpeaking()
+                if (nextMuted) {
+                    followUpListenJob?.cancel()
+                    allowAutoFollowUpForCurrentTurn = false
+                    voiceController.stopSpeaking()
+                }
                 cur.copy(muted = nextMuted)
             }
         }
@@ -972,6 +1213,9 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     }
 
     companion object {
+        private const val MAX_ROUTINE_CHAIN_DEPTH = 2
+        private const val MAX_CONSECUTIVE_VOICE_ERRORS = 2
+
         @Volatile
         private var INSTANCE: JarvisAssistantRuntime? = null
 

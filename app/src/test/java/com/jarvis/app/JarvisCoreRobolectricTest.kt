@@ -29,6 +29,8 @@ import com.jarvis.app.platform.WakeOnLan
 import com.jarvis.app.ui.JarvisViewModel
 import com.jarvis.app.ui.components.OrbState
 import com.jarvis.app.ui.components.resolveOrbState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -759,6 +761,467 @@ class JarvisCoreRobolectricTest {
 
         fgsController.destroy()
         stopController.destroy()
+    }
+
+    @Test
+    fun `barge in speech detector filters warmup spikes and speaker echo while detecting genuine speech`() {
+        // 1. With hardware AEC enabled: warmup frames & transient spikes must not trigger
+        val aecDetector = com.jarvis.app.platform.BargeInSpeechDetector(hasHardwareAec = true)
+        repeat(15) { // 300ms warmup
+            assertFalse(
+                "Warmup pop must never trigger barge-in",
+                aecDetector.processFrame(rmsNormalized = 0.25f, ttsSpeakingLevel = 0.6f)
+            )
+        }
+        // Single 40ms transient spike (2 frames) followed by silence must not trigger
+        assertFalse(aecDetector.processFrame(rmsNormalized = 0.22f, ttsSpeakingLevel = 0.6f))
+        assertFalse(aecDetector.processFrame(rmsNormalized = 0.20f, ttsSpeakingLevel = 0.6f))
+        repeat(4) {
+            assertFalse(aecDetector.processFrame(rmsNormalized = 0.01f, ttsSpeakingLevel = 0.6f))
+        }
+        // Residual speaker echo (~0.025) must stay below threshold
+        repeat(20) {
+            assertFalse(
+                "Residual AEC speaker echo must not trigger barge-in",
+                aecDetector.processFrame(rmsNormalized = 0.025f, ttsSpeakingLevel = 0.7f)
+            )
+        }
+        // Sustained genuine user speech (~0.14) over >= 180ms (9 frames) triggers once
+        var triggeredCount = 0
+        repeat(12) {
+            if (aecDetector.processFrame(rmsNormalized = 0.14f, ttsSpeakingLevel = 0.6f)) {
+                triggeredCount++
+            }
+        }
+        assertEquals("Genuine user speech must trigger barge-in exactly once", 1, triggeredCount)
+
+        // 2. Without hardware AEC: moderate speaker bleed is tolerated while louder user speech triggers
+        val noAecDetector = com.jarvis.app.platform.BargeInSpeechDetector(hasHardwareAec = false)
+        repeat(19) { // 380ms warmup with speaker bleed
+            assertFalse(noAecDetector.processFrame(rmsNormalized = 0.045f, ttsSpeakingLevel = 0.6f))
+        }
+        repeat(15) {
+            assertFalse(
+                "Speaker bleed without hardware AEC must not false-trigger",
+                noAecDetector.processFrame(rmsNormalized = 0.05f, ttsSpeakingLevel = 0.6f)
+            )
+        }
+        var noAecTriggered = false
+        repeat(15) { // >= 260ms genuine close speech
+            if (noAecDetector.processFrame(rmsNormalized = 0.24f, ttsSpeakingLevel = 0.6f)) {
+                noAecTriggered = true
+            }
+        }
+        assertTrue("Sustained close user speech without AEC must still trigger barge-in", noAecTriggered)
+
+        // 3. PCM16 RMS helper computes normalized amplitude safely
+        val silence = ShortArray(320) { 0 }
+        assertEquals(0f, com.jarvis.app.platform.computePcm16RmsNormalized(silence, silence.size), 0.0001f)
+        val speechSamples = ShortArray(320) { 8192 }
+        assertEquals(0.25f, com.jarvis.app.platform.computePcm16RmsNormalized(speechSamples, speechSamples.size), 0.005f)
+    }
+
+    @Test
+    fun `voice controller guards permissions prevents duplicate recognizer and isolates natural TTS completion`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val voice = VoiceController(app)
+        try {
+            // 1. Missing RECORD_AUDIO permission fails cleanly without starting recognizer
+            Shadows.shadowOf(app).denyPermissions(Manifest.permission.RECORD_AUDIO)
+            var failureMessage = ""
+            voice.startListening(
+                onFinalResult = {},
+                onFailure = { failureMessage = it }
+            )
+            assertTrue(failureMessage.contains("permission", ignoreCase = true))
+            assertFalse(voice.isListeningOrPending())
+
+            // 2. Grant permission: stopped/interrupted TTS must NOT emit ttsNaturalCompletions
+            Shadows.shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
+            val completions = mutableListOf<String>()
+            val collectorJob = launch(Dispatchers.Unconfined) {
+                voice.ttsNaturalCompletions.collect { completions.add(it) }
+            }
+
+            voice.simulateUtteranceStartForTest("utt-interrupted")
+            assertTrue(voice.isSpeaking.value)
+            voice.stopSpeaking(interruptedByBargeIn = true)
+            assertFalse(voice.isSpeaking.value)
+            assertTrue("Interrupted TTS must not emit natural completion", completions.isEmpty())
+
+            // 3. Natural utterance completion emits ttsNaturalCompletions once
+            voice.triggerTestUtteranceCompletion("utt-natural")
+            assertFalse(voice.isSpeaking.value)
+            assertEquals(listOf("utt-natural"), completions)
+
+            collectorJob.cancel()
+            voice.cancelListening()
+            assertFalse(voice.isListeningOrPending())
+        } finally {
+            voice.release()
+        }
+    }
+
+    @Test
+    fun `runtime handles barge-in interruption safely without duplicating listening sessions`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        Shadows.shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)
+        runtime.stopAssistant()
+
+        try {
+            runtime.activateVoiceOnlyUi(Intent.ACTION_ASSIST, nowMs = 95_000L)
+            assertTrue(runtime.isVoiceSessionActive.value)
+
+            // Simulate active TTS playback followed by genuine barge-in interruption
+            runtime.voiceController.simulateUtteranceStartForTest("utt-barge")
+            assertTrue(runtime.voiceController.isSpeaking.value)
+
+            runtime.voiceController.stopSpeaking(interruptedByBargeIn = true)
+            runtime.handleVoiceBargeIn()
+            ShadowLooper.runUiThreadTasks()
+
+            assertFalse("TTS must stay stopped after barge-in", runtime.voiceController.isSpeaking.value)
+            assertTrue("Voice session remains active across barge-in", runtime.isVoiceSessionActive.value)
+
+            // Manual stopCurrentWork aborts listening/TTS cleanly
+            runtime.stopCurrentWork()
+            assertFalse(runtime.voiceController.isListeningOrPending())
+            assertFalse(runtime.voiceController.isSpeaking.value)
+        } finally {
+            runtime.stopAssistant()
+        }
+    }
+
+    @Test
+    fun `voice controller sanitizeTextForSpeech removes urls markdown links and list markers while preserving multilingual speech`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val voice = VoiceController(app)
+        try {
+            val formatted = """
+                **Weather Summary**
+                - Check [Mumbai Forecast](https://weather.example.com/mumbai) and https://news.example.com/live (https://dup.example.com)
+                • Temperature is 24.5°C, hands-free mode is active on J.A.R.V.I.S.
+                1. Visit www.example.org/docs for details
+                2) Take a 5-minute break
+                ![Preview](https://cdn.example.com/img.png)
+                [CHART]{"title":"Temp","type":"bar","labels":["Now"],"values":[24]}[/CHART]
+            """.trimIndent()
+
+            val cleaned = voice.sanitizeTextForSpeech(formatted)
+            assertTrue(cleaned.contains("Weather Summary"))
+            assertTrue(cleaned.contains("Check Mumbai Forecast and"))
+            assertTrue(cleaned.contains("Temperature is 24.5°C, hands-free mode is active on J.A.R.V.I.S."))
+            assertTrue(cleaned.contains("Take a 5-minute break"))
+            assertFalse(cleaned.contains("https://"))
+            assertFalse(cleaned.contains("www.example.org"))
+            assertFalse(cleaned.contains("[CHART]"))
+            assertFalse(cleaned.contains("Preview"))
+            assertFalse(cleaned.contains("•"))
+            assertFalse(cleaned.contains("**"))
+            assertFalse(cleaned.lines().any { it.trimStart().startsWith("-") || it.trimStart().startsWith("1.") || it.trimStart().startsWith("2)") })
+
+            val devanagariAndHinglish = "नमस्ते! आज मौसम साफ है।\n• आजची कामं: मीटिंग\nAaj ka schedule set ho gaya hai."
+            val cleanedMultilingual = voice.sanitizeTextForSpeech(devanagariAndHinglish)
+            assertEquals("नमस्ते! आज मौसम साफ है।\nआजची कामं: मीटिंग\nAaj ka schedule set ho gaya hai.", cleanedMultilingual)
+        } finally {
+            voice.release()
+        }
+    }
+
+    @Test
+    fun `orchestrator builds multilingual speech-safe prompt for voice turns while preserving text chat rules`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, JarvisDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val repo = JarvisRepository(db.jarvisDao())
+            val configStore = com.jarvis.app.data.local.ConfigStore(context)
+            val secretStore = com.jarvis.app.data.security.SecureSecretStore(context)
+            val httpTools = com.jarvis.app.data.network.JarvisHttpTools()
+            val telemetry = com.jarvis.app.platform.DeviceTelemetry(context)
+            val deviceController = com.jarvis.app.platform.DeviceController(context)
+            val firebaseAiService = com.jarvis.app.data.ai.FirebaseAiService()
+            val byoAiClient = com.jarvis.app.data.ai.ByoAiClient()
+            val remotePcClient = com.jarvis.app.platform.RemotePcClient(context)
+            val tvControlClient = com.jarvis.app.platform.TvControlClient()
+            val toolExecutor = com.jarvis.app.domain.brain.ToolExecutor(
+                repository = repo,
+                configStore = configStore,
+                httpTools = httpTools,
+                telemetry = telemetry,
+                deviceController = deviceController,
+                firebaseAiService = firebaseAiService,
+                remotePcClient = remotePcClient,
+                tvControlClient = tvControlClient
+            )
+            val orchestrator = com.jarvis.app.domain.brain.JarvisOrchestrator(
+                repository = repo,
+                configStore = configStore,
+                secretStore = secretStore,
+                firebaseAiService = firebaseAiService,
+                byoAiClient = byoAiClient,
+                toolExecutor = toolExecutor
+            )
+
+            val cfg = com.jarvis.app.domain.model.BrainConfig()
+            val voicePrompt = orchestrator.buildSystemPrompt(
+                config = cfg,
+                agentId = cfg.selectedAgentId,
+                facts = listOf("User lives in Pune"),
+                isVoiceTurn = true
+            )
+            assertTrue(voicePrompt.contains("Hindi"))
+            assertTrue(voicePrompt.contains("Marathi"))
+            assertTrue(voicePrompt.contains("English"))
+            assertTrue(voicePrompt.contains("Hinglish"))
+            assertTrue(voicePrompt.contains("Devanagari"))
+            assertTrue(voicePrompt.contains("never include raw URLs"))
+
+            val textPrompt = orchestrator.buildSystemPrompt(
+                config = cfg,
+                agentId = cfg.selectedAgentId,
+                facts = listOf("User lives in Pune")
+            )
+            assertTrue(textPrompt.contains("If the user asks for structured visuals"))
+            assertFalse(textPrompt.contains("Voice conversation is ACTIVE"))
+
+            // Backward-compatible executeTurn caller without explicit isVoiceTurn keeps working
+            val events = mutableListOf<com.jarvis.app.domain.brain.TurnProgressEvent>()
+            orchestrator.executeTurn(
+                rawUserInput = "what is the current time?",
+                attachedBitmap = null,
+                history = emptyList(),
+                brainConfig = cfg
+            ).collect { events.add(it) }
+            val finished = events.filterIsInstance<com.jarvis.app.domain.brain.TurnProgressEvent.Finished>().lastOrNull()
+            assertNotNull(finished)
+            assertFalse(finished?.isError ?: true)
+        } finally {
+            db.close()
+        }
+    }
+
+    private fun waitForRuntimeIdle(
+        runtime: com.jarvis.app.platform.JarvisAssistantRuntime,
+        timeoutMs: Long = 3_000L
+    ) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            ShadowLooper.runUiThreadTasks()
+            if (!runtime.isTurnActiveForTest() && !runtime.isBusy.value && runtime.streamingMessage.value == null) {
+                ShadowLooper.runUiThreadTasks()
+                return
+            }
+            Thread.sleep(10L)
+        }
+    }
+
+    @Test
+    fun `runtime executes nested routine sequentially without cancelling parent turn and preserves voice context`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        Shadows.shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)
+        ShadowLooper.runUiThreadTasks()
+        runtime.stopAssistant()
+
+        val observedTurns = mutableListOf<Triple<String, Boolean, Boolean>>() // prompt, isVoiceTurn, parentCompleted
+        try {
+            runtime.activateVoiceOnlyUi(Intent.ACTION_ASSIST, nowMs = 120_000L)
+            runtime.turnExecutorOverride = { rawInput, _, _, _, isVoiceTurn ->
+                kotlinx.coroutines.flow.flow {
+                    if (rawInput == "run morning routine") {
+                        emit(
+                            com.jarvis.app.domain.brain.TurnProgressEvent.SideEffect(
+                                com.jarvis.app.domain.brain.ToolSideEffects(runRoutinePrompt = "check weather in pune")
+                            )
+                        )
+                        // Yield to confirm the parent turn is NOT cancelled when SideEffect arrives.
+                        kotlinx.coroutines.yield()
+                        emit(com.jarvis.app.domain.brain.TurnProgressEvent.StreamingText("Running Morning routine."))
+                        emit(
+                            com.jarvis.app.domain.brain.TurnProgressEvent.Finished(
+                                replyText = "Running Morning routine.",
+                                agentId = "jarvis",
+                                activities = emptyList(),
+                                isError = false
+                            )
+                        )
+                        observedTurns.add(Triple(rawInput, isVoiceTurn, true))
+                    } else {
+                        // Self-chaining attempt beyond depth cap must stop cleanly without infinite loops.
+                        emit(
+                            com.jarvis.app.domain.brain.TurnProgressEvent.SideEffect(
+                                com.jarvis.app.domain.brain.ToolSideEffects(runRoutinePrompt = "extra recursive prompt")
+                            )
+                        )
+                        emit(
+                            com.jarvis.app.domain.brain.TurnProgressEvent.Finished(
+                                replyText = "Completed $rawInput",
+                                agentId = "jarvis",
+                                activities = emptyList(),
+                                isError = false
+                            )
+                        )
+                        observedTurns.add(Triple(rawInput, isVoiceTurn, true))
+                    }
+                }
+            }
+
+            runtime.sendUserMessage("run morning routine", openChatIfHome = false, initiatedByVoice = true)
+            waitForRuntimeIdle(runtime)
+
+            assertEquals(3, observedTurns.size)
+            assertEquals("run morning routine", observedTurns[0].first)
+            assertTrue("Parent turn must preserve voice flag", observedTurns[0].second)
+            assertTrue("Parent turn must complete without cancellation", observedTurns[0].third)
+
+            assertEquals("check weather in pune", observedTurns[1].first)
+            assertTrue("Chained routine must preserve initiatedByVoice", observedTurns[1].second)
+
+            assertEquals("extra recursive prompt", observedTurns[2].first)
+            assertTrue("Depth-2 routine must preserve initiatedByVoice", observedTurns[2].second)
+
+            assertFalse("Runtime must clear busy state after chain finishes", runtime.isBusy.value)
+            assertNull(runtime.streamingMessage.value)
+            assertTrue(runtime.isLastTurnInitiatedByVoiceForTest())
+        } finally {
+            runtime.turnExecutorOverride = null
+            runtime.stopAssistant()
+        }
+    }
+
+    @Test
+    fun `runtime recovers safely from AI and runtime exceptions and caps consecutive error re-arming`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        Shadows.shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)
+        ShadowLooper.runUiThreadTasks()
+        runtime.stopAssistant()
+
+        try {
+            runtime.activateVoiceOnlyUi(Intent.ACTION_ASSIST, nowMs = 150_000L)
+            runtime.consumeBanner()
+
+            // 1. First failure (uncaught runtime exception): clears busy state, posts banner, allows single recovery
+            runtime.turnExecutorOverride = { _, _, _, _, _ ->
+                kotlinx.coroutines.flow.flow {
+                    throw IllegalStateException("Transient backend failure")
+                }
+            }
+            runtime.sendUserMessage("hello jarvis", initiatedByVoice = true)
+            waitForRuntimeIdle(runtime)
+
+            assertFalse(runtime.isBusy.value)
+            assertNull(runtime.streamingMessage.value)
+            assertNotNull("Voice failure should surface user-visible notice", runtime.bannerMessage.value)
+            assertTrue("First voice error should allow hands-free recovery", runtime.isAutoFollowUpAllowedForTest())
+
+            // 2. Second consecutive failure (AI Finished isError=true): disables auto re-arming to prevent loop
+            runtime.consumeBanner()
+            runtime.turnExecutorOverride = { _, _, _, _, _ ->
+                kotlinx.coroutines.flow.flow {
+                    emit(
+                        com.jarvis.app.domain.brain.TurnProgressEvent.Finished(
+                            replyText = "Couldn't reach Firebase AI right now.",
+                            agentId = "jarvis",
+                            activities = emptyList(),
+                            isError = true
+                        )
+                    )
+                }
+            }
+            runtime.sendUserMessage("try again", initiatedByVoice = true)
+            waitForRuntimeIdle(runtime)
+
+            assertFalse(runtime.isBusy.value)
+            assertEquals("Couldn't reach Firebase AI right now.", runtime.bannerMessage.value)
+            assertFalse("Consecutive errors must stop automatic listening re-arm", runtime.isAutoFollowUpAllowedForTest())
+
+            // 3. Subsequent successful turn resets error streak and restores auto follow-up
+            runtime.turnExecutorOverride = { _, _, _, _, _ ->
+                kotlinx.coroutines.flow.flow {
+                    emit(
+                        com.jarvis.app.domain.brain.TurnProgressEvent.Finished(
+                            replyText = "All systems operational.",
+                            agentId = "jarvis",
+                            activities = emptyList(),
+                            isError = false
+                        )
+                    )
+                }
+            }
+            runtime.sendUserMessage("status", initiatedByVoice = true)
+            waitForRuntimeIdle(runtime)
+
+            assertFalse(runtime.isBusy.value)
+            assertTrue("Successful turn must restore auto follow-up", runtime.isAutoFollowUpAllowedForTest())
+        } finally {
+            runtime.turnExecutorOverride = null
+            runtime.stopAssistant()
+        }
+    }
+
+    @Test
+    fun `voice controller and runtime handle tts unavailability and utterance errors gracefully`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        Shadows.shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val voice = VoiceController(app)
+        ShadowLooper.runUiThreadTasks()
+        try {
+            // 1. Uninitialized/failed TTS returns false from speak() without getting stuck speaking
+            voice.setTtsReadyForTest(false)
+            assertFalse(voice.speak("Hello"))
+            assertFalse(voice.isSpeaking.value)
+            assertNotNull(voice.voiceError.value)
+
+            // 2. Utterance error emits ttsSpeechFailures and NOT ttsNaturalCompletions
+            val completions = mutableListOf<String>()
+            val failures = mutableListOf<String>()
+            val cJob = launch(Dispatchers.Unconfined) { voice.ttsNaturalCompletions.collect { completions.add(it) } }
+            val fJob = launch(Dispatchers.Unconfined) { voice.ttsSpeechFailures.collect { failures.add(it) } }
+
+            voice.triggerTestUtteranceFailure("utt-err-1")
+            assertFalse(voice.isSpeaking.value)
+            assertTrue("TTS failure must not emit natural completion", completions.isEmpty())
+            assertEquals(listOf("utt-err-1"), failures)
+
+            cJob.cancel()
+            fJob.cancel()
+        } finally {
+            voice.release()
+        }
+
+        // 3. Runtime keeps voice session consistent when TTS fails mid-session
+        val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)
+        ShadowLooper.runUiThreadTasks()
+        runtime.stopAssistant()
+        try {
+            runtime.activateVoiceOnlyUi(Intent.ACTION_ASSIST, nowMs = 180_000L)
+            runtime.voiceController.setTtsReadyForTest(false)
+            runtime.turnExecutorOverride = { _, _, _, _, _ ->
+                kotlinx.coroutines.flow.flow {
+                    emit(
+                        com.jarvis.app.domain.brain.TurnProgressEvent.Finished(
+                            replyText = "Done.",
+                            agentId = "jarvis",
+                            activities = emptyList(),
+                            isError = false
+                        )
+                    )
+                }
+            }
+            runtime.sendUserMessage("turn on light", initiatedByVoice = true)
+            waitForRuntimeIdle(runtime)
+
+            assertFalse(runtime.isBusy.value)
+            assertFalse(runtime.voiceController.isSpeaking.value)
+            assertTrue("Voice session stays active cleanly when TTS fails", runtime.isVoiceSessionActive.value)
+        } finally {
+            runtime.turnExecutorOverride = null
+            runtime.stopAssistant()
+        }
     }
 
     private class InMemorySecretStorage : SecretStorage {

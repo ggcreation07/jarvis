@@ -59,7 +59,8 @@ class JarvisOrchestrator(
         rawUserInput: String,
         attachedBitmap: Bitmap?,
         history: List<ChatMessageItem>,
-        brainConfig: BrainConfig
+        brainConfig: BrainConfig,
+        isVoiceTurn: Boolean = false
     ): Flow<TurnProgressEvent> = flow {
         val (agentId, cleanInput) = parseAgentMention(rawUserInput, brainConfig.selectedAgentId)
         emit(TurnProgressEvent.AgentSelected(agentId))
@@ -77,6 +78,65 @@ class JarvisOrchestrator(
             )
         )
 
+        // 0. Resolve any pending execution-level confirmation before routing new commands
+        if (attachedBitmap != null) {
+            toolExecutor.clearPendingConfirmation()
+        } else {
+            when (
+                val confOutcome = toolExecutor.handleConfirmationInput(cleanInput) { effect ->
+                    emit(TurnProgressEvent.SideEffect(effect))
+                }
+            ) {
+                is ConfirmationTurnOutcome.Cancelled -> {
+                    repository.upsertTaskRecord(
+                        TaskRecordItem(taskId, cleanInput.take(120), "cancelled", agentId, 0, confOutcome.replyText.take(160))
+                    )
+                    emit(TurnProgressEvent.Finished(confOutcome.replyText, agentId, emptyList(), isError = false))
+                    return@flow
+                }
+                is ConfirmationTurnOutcome.Expired -> {
+                    repository.upsertTaskRecord(
+                        TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, confOutcome.replyText.take(160))
+                    )
+                    emit(TurnProgressEvent.Finished(confOutcome.replyText, agentId, emptyList(), isError = false))
+                    return@flow
+                }
+                is ConfirmationTurnOutcome.NeedsClarification -> {
+                    repository.upsertTaskRecord(
+                        TaskRecordItem(taskId, cleanInput.take(120), "awaiting_confirmation", agentId, 0, confOutcome.replyText.take(160))
+                    )
+                    emit(TurnProgressEvent.Finished(confOutcome.replyText, agentId, emptyList(), isError = false))
+                    return@flow
+                }
+                is ConfirmationTurnOutcome.Executed -> {
+                    val res = confOutcome.result
+                    val toolName = confOutcome.pending.binding.toolName
+                    val act = ToolActivityItem(
+                        id = "act_${System.currentTimeMillis()}",
+                        toolName = toolName,
+                        label = toolName.replace("_", " "),
+                        status = if (res.ok) "succeeded" else "failed",
+                        summary = res.summary
+                    )
+                    activities.add(act)
+                    emit(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
+                    repository.upsertTaskRecord(
+                        TaskRecordItem(
+                            id = taskId,
+                            objective = cleanInput.take(120),
+                            state = if (res.ok) "succeeded" else "suspended",
+                            agentId = agentId,
+                            stepsCount = 1,
+                            summary = res.summary.take(160)
+                        )
+                    )
+                    emit(TurnProgressEvent.Finished(res.summary, agentId, activities.toList(), isError = !res.ok))
+                    return@flow
+                }
+                ConfirmationTurnOutcome.None -> Unit
+            }
+        }
+
         // 1. Fast deterministic local match when there is no image attached
         if (attachedBitmap == null) {
             val direct = DirectCommandMatcher.match(cleanInput)
@@ -88,8 +148,13 @@ class JarvisOrchestrator(
                 val res = toolExecutor.execute(direct.toolName, jsonArgs) { effect ->
                     emit(TurnProgressEvent.SideEffect(effect))
                 }
+                val awaitingConfirmation = res.isConfirmationRequired()
                 activities[0] = activities[0].copy(
-                    status = if (res.ok) "succeeded" else "failed",
+                    status = when {
+                        res.ok -> "succeeded"
+                        awaitingConfirmation -> "awaiting_confirmation"
+                        else -> "failed"
+                    },
                     summary = res.summary
                 )
                 emit(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
@@ -97,20 +162,36 @@ class JarvisOrchestrator(
                     TaskRecordItem(
                         id = taskId,
                         objective = cleanInput.take(120),
-                        state = if (res.ok) "succeeded" else "suspended",
+                        state = when {
+                            res.ok -> "succeeded"
+                            awaitingConfirmation -> "awaiting_confirmation"
+                            else -> "suspended"
+                        },
                         agentId = agentId,
                         stepsCount = 1,
                         summary = res.summary
                     )
                 )
-                emit(TurnProgressEvent.Finished(res.summary, agentId, activities.toList(), !res.ok))
+                emit(
+                    TurnProgressEvent.Finished(
+                        replyText = res.summary,
+                        agentId = agentId,
+                        activities = activities.toList(),
+                        isError = !res.ok && !awaitingConfirmation
+                    )
+                )
                 return@flow
             }
         }
 
         // 2. Build rich grounded system prompt with user memory & agent instructions
         val facts = repository.getFactsOnce()
-        val systemPrompt = buildSystemPrompt(brainConfig, agentId, facts.map { it.text })
+        val systemPrompt = buildSystemPrompt(
+            config = brainConfig,
+            agentId = agentId,
+            facts = facts.map { it.text },
+            isVoiceTurn = isVoiceTurn
+        )
         val priorTurns = history.filter { !it.isError && it.content.isNotBlank() }.map { it.role to it.content }
 
         // 3. Check if user explicitly selected a BYO provider with a stored key
@@ -153,6 +234,7 @@ class JarvisOrchestrator(
         // 4. Default & Primary: Built-in Firebase AI Logic with tool calling + streaming
         try {
             var finalReply = ""
+            val confirmationPendingCalls = mutableListOf<String>()
             firebaseAiService.streamWithTools(
                 modelName = brainConfig.activeModel,
                 systemPrompt = systemPrompt,
@@ -162,9 +244,13 @@ class JarvisOrchestrator(
                 pcPaired = brainConfig.pcPaired && brainConfig.pcHost.isNotBlank(),
                 tvPaired = brainConfig.tvPaired && brainConfig.tvHost.isNotBlank(),
                 executeTool = { call ->
-                    toolExecutor.execute(call.name, call.args) { effect ->
+                    val res = toolExecutor.execute(call.name, call.args) { effect ->
                         emit(TurnProgressEvent.SideEffect(effect))
                     }
+                    if (res.isConfirmationRequired()) {
+                        confirmationPendingCalls.add(call.name)
+                    }
+                    res
                 }
             ).collect { event ->
                 when (event) {
@@ -180,10 +266,15 @@ class JarvisOrchestrator(
                         emit(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
                     }
                     is AiStreamEvent.ToolFinished -> {
+                        val awaitingConfirmation = confirmationPendingCalls.remove(event.toolName)
                         val idx = activities.indexOfLast { it.toolName == event.toolName && it.status == "running" }
                         if (idx >= 0) {
                             activities[idx] = activities[idx].copy(
-                                status = if (event.ok) "succeeded" else "failed",
+                                status = when {
+                                    event.ok -> "succeeded"
+                                    awaitingConfirmation -> "awaiting_confirmation"
+                                    else -> "failed"
+                                },
                                 summary = event.summary
                             )
                             emit(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
@@ -197,11 +288,16 @@ class JarvisOrchestrator(
                     }
                 }
             }
+            val finalState = if (activities.any { it.status == "awaiting_confirmation" }) {
+                "awaiting_confirmation"
+            } else {
+                "succeeded"
+            }
             repository.upsertTaskRecord(
                 TaskRecordItem(
                     id = taskId,
                     objective = cleanInput.take(120),
-                    state = "succeeded",
+                    state = finalState,
                     agentId = agentId,
                     stepsCount = activities.size.coerceAtLeast(1),
                     summary = finalReply.take(180)
@@ -222,17 +318,28 @@ class JarvisOrchestrator(
         }
     }
 
-    private fun buildSystemPrompt(
+    internal fun buildSystemPrompt(
         config: BrainConfig,
         agentId: String,
-        facts: List<String>
+        facts: List<String>,
+        isVoiceTurn: Boolean = false
     ): String {
         val now = SimpleDateFormat("EEEE, MMM d, yyyy 'at' h:mm a", Locale.getDefault()).format(Date())
         val agent = JARVIS_AGENTS.firstOrNull { it.id == agentId } ?: JARVIS_AGENTS.first()
-        val brevity = if (config.conversationMode) {
-            "Conversation mode is ON: keep replies natural, crisp, and 1-2 short spoken sentences unless details are asked for."
+        val brevity = when {
+            isVoiceTurn ->
+                "Voice conversation is ACTIVE: reply naturally in the user's language (Hindi, Marathi, English, or Hinglish). " +
+                    "Prefer Devanagari script for Hindi and Marathi replies when appropriate, and natural Roman Hinglish when the user speaks in Romanized Hinglish. " +
+                    "Keep spoken replies concise, warm, and conversational (1-3 short sentences unless more detail is explicitly requested)."
+            config.conversationMode ->
+                "Conversation mode is ON: keep replies natural, crisp, and 1-2 short spoken sentences unless details are asked for."
+            else ->
+                "Be helpful, direct, grounded in real tool results, and well structured."
+        }
+        val formattingRule = if (isVoiceTurn) {
+            "- Format strictly for spoken audio: never include raw URLs, Markdown links, [CHART]/[TABLE]/[FLOWCHART]/[SCHEDULE] tags, bullet symbols, or unnecessary markdown formatting."
         } else {
-            "Be helpful, direct, grounded in real tool results, and well structured."
+            "- If the user asks for structured visuals, you may use [CHART]{\"title\":\"...\",\"type\":\"bar\",\"labels\":[...],\"values\":[...]}[/CHART], [TABLE]{\"title\":\"...\",\"headers\":[...],\"rows\":[[...]]}[/TABLE], [FLOWCHART]{\"title\":\"...\",\"steps\":[...]}[/FLOWCHART], or [SCHEDULE]{\"title\":\"...\",\"items\":[{\"time\":\"...\",\"task\":\"...\"}]}[/SCHEDULE]."
         }
         val factsBlock = if (facts.isNotEmpty()) {
             "\nKnown user facts:\n" + facts.take(15).joinToString("\n") { "- $it" }
@@ -245,7 +352,8 @@ class JarvisOrchestrator(
             $brevity
             Rules:
             - Never claim you performed a device action, set a timer/alarm, checked weather, read notifications, or changed a setting unless the corresponding tool returned ok=true.
-            - If the user asks for structured visuals, you may use [CHART]{"title":"...","type":"bar","labels":[...],"values":[...]}[/CHART], [TABLE]{"title":"...","headers":[...],"rows":[[...]]}[/TABLE], [FLOWCHART]{"title":"...","steps":[...]}[/FLOWCHART], or [SCHEDULE]{"title":"...","items":[{"time":"...","task":"..."}]}[/SCHEDULE].
+            - If a tool returns status='confirmation_required', explain clearly what will happen and ask the user for explicit confirmation, and never claim the action was already executed.
+            $formattingRule
             - For artwork/drawings/wallpapers, call generate_image. For QR codes, call make_qr_code.
             $factsBlock
         """.trimIndent()

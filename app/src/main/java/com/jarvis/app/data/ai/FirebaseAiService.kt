@@ -36,7 +36,7 @@ sealed interface AiStreamEvent {
     data class Completed(val finalText: String) : AiStreamEvent
 }
 
-class FirebaseAiService {
+open class FirebaseAiService {
 
     companion object {
         private const val TAG = "FirebaseAiService"
@@ -237,7 +237,7 @@ class FirebaseAiService {
         return list
     }
 
-    fun streamWithTools(
+    open fun streamWithTools(
         modelName: String,
         systemPrompt: String,
         history: List<Pair<String, String>>,

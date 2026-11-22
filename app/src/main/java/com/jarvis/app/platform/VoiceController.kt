@@ -4,7 +4,14 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.media.audiofx.Visualizer
 import android.os.Build
 import android.os.Bundle
@@ -20,17 +27,86 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.sin
 import kotlin.math.sqrt
+
+internal class BargeInSpeechDetector(
+    private val hasHardwareAec: Boolean,
+    private val warmupMs: Long = if (hasHardwareAec) 300L else 380L,
+    private val requiredSpeechMs: Long = if (hasHardwareAec) 180L else 260L,
+    private val frameDurationMs: Long = 20L
+) {
+    private var elapsedMs: Long = 0L
+    private var accumulatedSpeechMs: Long = 0L
+    private var silenceHangoverMs: Long = 0L
+    private var noiseFloor: Float = if (hasHardwareAec) 0.012f else 0.025f
+    private var triggered: Boolean = false
+
+    fun reset() {
+        elapsedMs = 0L
+        accumulatedSpeechMs = 0L
+        silenceHangoverMs = 0L
+        noiseFloor = if (hasHardwareAec) 0.012f else 0.025f
+        triggered = false
+    }
+
+    fun processFrame(rmsNormalized: Float, ttsSpeakingLevel: Float): Boolean {
+        if (triggered) return false
+        val clampedRms = rmsNormalized.coerceIn(0f, 1f)
+        val clampedTts = ttsSpeakingLevel.coerceIn(0f, 1f)
+        elapsedMs += frameDurationMs
+
+        val minBase = if (hasHardwareAec) 0.038f else 0.072f
+        val floorMultiplier = if (hasHardwareAec) 2.2f else 2.2f
+        val echoMargin = if (hasHardwareAec) clampedTts * 0.018f else clampedTts * 0.055f
+        val threshold = maxOf(minBase, noiseFloor * floorMultiplier + echoMargin)
+
+        if (elapsedMs <= warmupMs) {
+            noiseFloor = (noiseFloor * 0.80f + clampedRms * 0.20f).coerceIn(0.005f, 0.09f)
+            return false
+        }
+
+        if (clampedRms >= threshold) {
+            accumulatedSpeechMs += frameDurationMs
+            silenceHangoverMs = 0L
+            if (accumulatedSpeechMs >= requiredSpeechMs) {
+                triggered = true
+                return true
+            }
+        } else {
+            noiseFloor = (noiseFloor * 0.94f + clampedRms * 0.06f).coerceIn(0.005f, 0.09f)
+            silenceHangoverMs += frameDurationMs
+            if (silenceHangoverMs > 60L) {
+                accumulatedSpeechMs = 0L
+            }
+        }
+        return false
+    }
+}
+
+internal fun computePcm16RmsNormalized(buffer: ShortArray, readCount: Int): Float {
+    if (readCount <= 0) return 0f
+    var sumSq = 0.0
+    val count = readCount.coerceAtMost(buffer.size)
+    for (i in 0 until count) {
+        val sample = buffer[i] / 32768.0
+        sumSq += sample * sample
+    }
+    return sqrt(sumSq / count).toFloat().coerceIn(0f, 1f)
+}
 
 class VoiceController(private val context: Context) {
 
@@ -40,9 +116,26 @@ class VoiceController(private val context: Context) {
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var ttsAudioSessionId: Int = AudioManager.AUDIO_SESSION_ID_GENERATE
+    private var ttsAudioFocusRequest: AudioFocusRequest? = null
 
     @Volatile
     private var activeUtteranceId: String? = null
+
+    @Volatile
+    private var utteranceInterruptedOrStopped: Boolean = false
+
+    @Volatile
+    private var pendingBargeInCallback: (() -> Unit)? = null
+
+    @Volatile
+    private var isListeningRequested: Boolean = false
+
+    @Volatile
+    private var activeRecognitionSessionId: Long = 0L
+
+    private val bargeInLock = Any()
+    private var bargeInMonitorJob: Job? = null
+    private var activeAudioRecord: AudioRecord? = null
 
     private var visualizer: Visualizer? = null
     private var fallbackMeterJob: Job? = null
@@ -59,6 +152,12 @@ class VoiceController(private val context: Context) {
     private val _isSpeaking = MutableStateFlow(false)
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
 
+    private val _ttsNaturalCompletions = MutableSharedFlow<String>(extraBufferCapacity = 4)
+    val ttsNaturalCompletions: SharedFlow<String> = _ttsNaturalCompletions.asSharedFlow()
+
+    private val _ttsSpeechFailures = MutableSharedFlow<String>(extraBufferCapacity = 4)
+    val ttsSpeechFailures: SharedFlow<String> = _ttsSpeechFailures.asSharedFlow()
+
     private val _partialTranscript = MutableStateFlow("")
     val partialTranscript: StateFlow<String> = _partialTranscript.asStateFlow()
 
@@ -74,6 +173,19 @@ class VoiceController(private val context: Context) {
     private val _voiceError = MutableStateFlow<String?>(null)
     val voiceError: StateFlow<String?> = _voiceError.asStateFlow()
 
+    private val ttsAudioFocusListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                scope.launch(Dispatchers.Main.immediate) {
+                    if (_isSpeaking.value || activeUtteranceId != null) {
+                        stopSpeaking()
+                    }
+                }
+            }
+        }
+    }
+
     init {
         initAudioSession()
         initTts()
@@ -87,21 +199,56 @@ class VoiceController(private val context: Context) {
         }.getOrDefault(AudioManager.AUDIO_SESSION_ID_GENERATE)
     }
 
+    private fun handleUtteranceError(utteranceId: String?) {
+        val current = activeUtteranceId
+        if (current == null || (utteranceId != null && utteranceId != current)) {
+            return
+        }
+        val wasInterrupted = utteranceInterruptedOrStopped
+        activeUtteranceId = null
+        pendingBargeInCallback = null
+        finishSpeakingState()
+        if (!wasInterrupted) {
+            _voiceError.value = "Voice playback error."
+            _ttsSpeechFailures.tryEmit(utteranceId ?: current)
+        }
+    }
+
     private fun initTts() {
         try {
             tts = TextToSpeech(context.applicationContext) { status ->
                 if (status == TextToSpeech.SUCCESS) {
-                    tts?.language = Locale.getDefault()
+                    runCatching {
+                        tts?.language = Locale.getDefault()
+                        tts?.setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build()
+                        )
+                    }
                     ttsReady = true
                     tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) {
-                            if (utteranceId != null && activeUtteranceId != null && utteranceId != activeUtteranceId) return
+                            val current = activeUtteranceId
+                            if (current == null || (utteranceId != null && utteranceId != current) || utteranceInterruptedOrStopped) {
+                                return
+                            }
                             _isSpeaking.value = true
                             scope.launch { startSpeakingMetering() }
+                            val bargeInCallback = pendingBargeInCallback
+                            if (bargeInCallback != null) {
+                                scope.launch {
+                                    startBargeInMonitor(current, bargeInCallback)
+                                }
+                            }
                         }
 
                         override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
-                            if (utteranceId != null && activeUtteranceId != null && utteranceId != activeUtteranceId) return
+                            val current = activeUtteranceId
+                            if (current == null || (utteranceId != null && utteranceId != current) || utteranceInterruptedOrStopped) {
+                                return
+                            }
                             if (!hasReceivedRealVisualizerEnergy) {
                                 val span = (end - start).coerceIn(1, 16)
                                 fallbackTargetLevel = (0.34f + (span / 16f) * 0.44f).coerceIn(0.32f, 0.82f)
@@ -109,25 +256,49 @@ class VoiceController(private val context: Context) {
                         }
 
                         override fun onDone(utteranceId: String?) {
-                            if (utteranceId != null && activeUtteranceId != null && utteranceId != activeUtteranceId) return
+                            val current = activeUtteranceId
+                            if (current == null || (utteranceId != null && utteranceId != current)) {
+                                return
+                            }
+                            val wasInterrupted = utteranceInterruptedOrStopped
+                            activeUtteranceId = null
+                            pendingBargeInCallback = null
                             finishSpeakingState()
+                            if (!wasInterrupted) {
+                                _ttsNaturalCompletions.tryEmit(utteranceId ?: current)
+                            }
                         }
 
                         override fun onStop(utteranceId: String?, interrupted: Boolean) {
-                            if (utteranceId != null && activeUtteranceId != null && utteranceId != activeUtteranceId) return
+                            val current = activeUtteranceId
+                            if (current == null || (utteranceId != null && utteranceId != current)) {
+                                return
+                            }
+                            activeUtteranceId = null
+                            pendingBargeInCallback = null
                             finishSpeakingState()
+                        }
+
+                        override fun onError(utteranceId: String?, errorCode: Int) {
+                            handleUtteranceError(utteranceId)
                         }
 
                         @Deprecated("Deprecated in Java")
                         override fun onError(utteranceId: String?) {
-                            if (utteranceId != null && activeUtteranceId != null && utteranceId != activeUtteranceId) return
-                            finishSpeakingState()
+                            handleUtteranceError(utteranceId)
                         }
                     })
+                } else {
+                    ttsReady = false
+                    _voiceError.value = "Text-to-speech engine failed to initialize."
+                    runCatching { tts?.shutdown() }
+                    tts = null
                 }
             }
         } catch (_: Exception) {
             ttsReady = false
+            tts = null
+            _voiceError.value = "Text-to-speech engine unavailable."
         }
     }
 
@@ -227,36 +398,246 @@ class VoiceController(private val context: Context) {
     private fun finishSpeakingState() {
         _isSpeaking.value = false
         _speakingLevel.value = 0f
+        abandonTtsAudioFocus()
         scope.launch { stopSpeakingMeteringOnly() }
     }
+
+    private fun requestTtsAudioFocus() {
+        runCatching {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val req = ttsAudioFocusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .setAcceptsDelayedFocusGain(false)
+                    .setOnAudioFocusChangeListener(ttsAudioFocusListener)
+                    .build()
+                    .also { ttsAudioFocusRequest = it }
+                am.requestAudioFocus(req)
+            } else {
+                @Suppress("DEPRECATION")
+                am.requestAudioFocus(
+                    ttsAudioFocusListener,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                )
+            }
+        }
+    }
+
+    private fun abandonTtsAudioFocus() {
+        runCatching {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ttsAudioFocusRequest?.let { req ->
+                    am.abandonAudioFocusRequest(req)
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                am.abandonAudioFocus(ttsAudioFocusListener)
+            }
+        }
+    }
+
+    private fun startBargeInMonitor(utteranceId: String, onBargeInDetected: () -> Unit) {
+        if (activeUtteranceId != utteranceId ||
+            utteranceInterruptedOrStopped ||
+            isListeningOrPending() ||
+            !hasRecordAudioPermission()
+        ) {
+            return
+        }
+
+        synchronized(bargeInLock) {
+            bargeInMonitorJob?.cancel()
+            runCatching { activeAudioRecord?.stop() }
+            bargeInMonitorJob = scope.launch(Dispatchers.IO) {
+                val sampleRate = 16000
+                val minBuf = runCatching {
+                    AudioRecord.getMinBufferSize(
+                        sampleRate,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT
+                    )
+                }.getOrDefault(AudioRecord.ERROR)
+                if (minBuf <= 0) return@launch
+
+                val frameSamples = 320 // 20ms @ 16kHz
+                val bufferBytes = maxOf(minBuf * 2, frameSamples * 4 * 2)
+                val record = runCatching {
+                    AudioRecord.Builder()
+                        .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                        .setAudioFormat(
+                            AudioFormat.Builder()
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setSampleRate(sampleRate)
+                                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                                .build()
+                        )
+                        .setBufferSizeInBytes(bufferBytes)
+                        .build()
+                }.getOrNull() ?: return@launch
+
+                if (record.state != AudioRecord.STATE_INITIALIZED) {
+                    runCatching { record.release() }
+                    return@launch
+                }
+
+                val aec = if (runCatching { AcousticEchoCanceler.isAvailable() }.getOrDefault(false)) {
+                    runCatching {
+                        AcousticEchoCanceler.create(record.audioSessionId)?.apply { enabled = true }
+                    }.getOrNull()
+                } else {
+                    null
+                }
+                val ns = if (runCatching { NoiseSuppressor.isAvailable() }.getOrDefault(false)) {
+                    runCatching {
+                        NoiseSuppressor.create(record.audioSessionId)?.apply { enabled = true }
+                    }.getOrNull()
+                } else {
+                    null
+                }
+
+                val hasHardwareAec = aec?.enabled == true
+                val detector = BargeInSpeechDetector(hasHardwareAec = hasHardwareAec)
+                val pcmBuffer = ShortArray(frameSamples)
+                var detected = false
+
+                synchronized(bargeInLock) {
+                    activeAudioRecord = record
+                }
+
+                try {
+                    record.startRecording()
+                    while (isActive && activeUtteranceId == utteranceId && !utteranceInterruptedOrStopped) {
+                        val read = record.read(pcmBuffer, 0, pcmBuffer.size)
+                        if (read > 0) {
+                            val rms = computePcm16RmsNormalized(pcmBuffer, read)
+                            if (detector.processFrame(rms, _speakingLevel.value)) {
+                                detected = true
+                                break
+                            }
+                        } else if (read < 0) {
+                            break
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Gracefully exit if AudioRecord fails or is interrupted during teardown.
+                } finally {
+                    synchronized(bargeInLock) {
+                        if (activeAudioRecord === record) {
+                            activeAudioRecord = null
+                        }
+                    }
+                    runCatching { record.stop() }
+                    runCatching { aec?.release() }
+                    runCatching { ns?.release() }
+                    runCatching { record.release() }
+                }
+
+                if (detected && activeUtteranceId == utteranceId && !utteranceInterruptedOrStopped) {
+                    scope.launch(Dispatchers.Main.immediate) {
+                        handleBargeInConfirmed(utteranceId, onBargeInDetected)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun stopBargeInMonitor(): Job? {
+        return synchronized(bargeInLock) {
+            val job = bargeInMonitorJob
+            bargeInMonitorJob = null
+            job?.cancel()
+            runCatching { activeAudioRecord?.stop() }
+            job
+        }
+    }
+
+    private fun handleBargeInConfirmed(utteranceId: String, onBargeInDetected: () -> Unit) {
+        if (activeUtteranceId != utteranceId || utteranceInterruptedOrStopped) return
+        stopSpeaking(interruptedByBargeIn = true)
+        onBargeInDetected()
+    }
+
+    fun hasRecordAudioPermission(): Boolean =
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+
+    fun isListeningOrPending(): Boolean = _isListening.value || isListeningRequested
+
+    fun isTtsReady(): Boolean = ttsReady
 
     fun isSpeechRecognitionAvailable(): Boolean =
         SpeechRecognizer.isRecognitionAvailable(context)
 
     fun startListening(onFinalResult: (String) -> Unit, onFailure: (String) -> Unit) {
+        if (!hasRecordAudioPermission()) {
+            val msg = "Microphone permission needed."
+            _voiceError.value = msg
+            onFailure(msg)
+            return
+        }
         if (!isSpeechRecognitionAvailable()) {
             val msg = "On-device speech recognition is unavailable on this device."
             _voiceError.value = msg
             onFailure(msg)
             return
         }
+        if (isListeningOrPending()) {
+            return
+        }
+
+        isListeningRequested = true
+        activeRecognitionSessionId += 1L
+        val sessionId = activeRecognitionSessionId
+
+        val monitorJob = stopBargeInMonitor()
         stopSpeaking()
         _voiceError.value = null
         _partialTranscript.value = ""
 
+        if (monitorJob != null && monitorJob.isActive) {
+            scope.launch(Dispatchers.Main.immediate) {
+                withTimeoutOrNull(250L) { monitorJob.join() }
+                if (sessionId == activeRecognitionSessionId && isListeningRequested) {
+                    beginSpeechRecognizerSession(sessionId, onFinalResult, onFailure)
+                }
+            }
+        } else {
+            beginSpeechRecognizerSession(sessionId, onFinalResult, onFailure)
+        }
+    }
+
+    private fun beginSpeechRecognizerSession(
+        sessionId: Long,
+        onFinalResult: (String) -> Unit,
+        onFailure: (String) -> Unit
+    ) {
+        if (sessionId != activeRecognitionSessionId || !isListeningRequested) return
+        var sessionTerminated = false
         try {
             speechRecognizer?.destroy()
             speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
                 setRecognitionListener(object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
+                        if (sessionTerminated || sessionId != activeRecognitionSessionId) return
                         _isListening.value = true
                     }
 
                     override fun onBeginningOfSpeech() {
+                        if (sessionTerminated || sessionId != activeRecognitionSessionId) return
                         _isListening.value = true
                     }
 
                     override fun onRmsChanged(rmsdB: Float) {
+                        if (sessionTerminated || sessionId != activeRecognitionSessionId) return
                         val normalized = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
                         _audioLevel.value = normalized
                     }
@@ -264,11 +645,16 @@ class VoiceController(private val context: Context) {
                     override fun onBufferReceived(buffer: ByteArray?) = Unit
 
                     override fun onEndOfSpeech() {
+                        if (sessionTerminated || sessionId != activeRecognitionSessionId) return
                         _isListening.value = false
                         _audioLevel.value = 0f
                     }
 
                     override fun onError(error: Int) {
+                        if (sessionTerminated || sessionId != activeRecognitionSessionId) return
+                        sessionTerminated = true
+                        activeRecognitionSessionId += 1L
+                        isListeningRequested = false
                         _isListening.value = false
                         _audioLevel.value = 0f
                         val msg = when (error) {
@@ -285,6 +671,10 @@ class VoiceController(private val context: Context) {
                     }
 
                     override fun onResults(results: Bundle?) {
+                        if (sessionTerminated || sessionId != activeRecognitionSessionId) return
+                        sessionTerminated = true
+                        activeRecognitionSessionId += 1L
+                        isListeningRequested = false
                         _isListening.value = false
                         _audioLevel.value = 0f
                         val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -300,6 +690,7 @@ class VoiceController(private val context: Context) {
                     }
 
                     override fun onPartialResults(partialResults: Bundle?) {
+                        if (sessionTerminated || sessionId != activeRecognitionSessionId) return
                         val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                             ?.firstOrNull()
                             .orEmpty()
@@ -314,11 +705,15 @@ class VoiceController(private val context: Context) {
 
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
+                putExtra(RecognizerIntent.EXTRA_SUPPORTED_LANGUAGES, arrayOf("en-IN", "hi-IN", "mr-IN", "en-US"))
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             }
             speechRecognizer?.startListening(intent)
         } catch (e: Exception) {
+            if (sessionId != activeRecognitionSessionId) return
+            isListeningRequested = false
             _isListening.value = false
             val msg = e.localizedMessage ?: "Couldn't start microphone."
             _voiceError.value = msg
@@ -327,6 +722,7 @@ class VoiceController(private val context: Context) {
     }
 
     fun stopListening() {
+        isListeningRequested = false
         _isListening.value = false
         _audioLevel.value = 0f
         try {
@@ -335,17 +731,103 @@ class VoiceController(private val context: Context) {
         }
     }
 
-    fun speak(text: String) {
-        if (!ttsReady || text.isBlank()) return
-        val clean = text
+    fun cancelListening() {
+        activeRecognitionSessionId += 1L
+        isListeningRequested = false
+        _isListening.value = false
+        _audioLevel.value = 0f
+        _partialTranscript.value = ""
+        try {
+            speechRecognizer?.cancel()
+            speechRecognizer?.destroy()
+            speechRecognizer = null
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun configureTtsForText(text: String) {
+        val ttsInstance = tts ?: return
+        fun isLangAvailable(loc: Locale): Int =
+            runCatching { ttsInstance.isLanguageAvailable(loc) }.getOrDefault(TextToSpeech.LANG_NOT_SUPPORTED)
+
+        val hasDevanagari = text.any { it in '\u0900'..'\u097F' }
+        val locale = when {
+            hasDevanagari -> {
+                val mrLocale = Locale("mr", "IN")
+                val hiLocale = Locale("hi", "IN")
+                if (text.contains("आहे") || text.contains("माझे") || text.contains("काय")) {
+                    if (isLangAvailable(mrLocale) >= TextToSpeech.LANG_AVAILABLE) mrLocale else hiLocale
+                } else {
+                    if (isLangAvailable(hiLocale) >= TextToSpeech.LANG_AVAILABLE) hiLocale else mrLocale
+                }
+            }
+            else -> {
+                val inLocale = Locale("en", "IN")
+                if (isLangAvailable(inLocale) >= TextToSpeech.LANG_AVAILABLE) inLocale else Locale.getDefault()
+            }
+        }
+
+        val availability = isLangAvailable(locale)
+        val selectedLocale = if (availability >= TextToSpeech.LANG_AVAILABLE) locale else Locale("en", "IN")
+
+        runCatching {
+            ttsInstance.language = selectedLocale
+            ttsInstance.setSpeechRate(1.02f)
+            ttsInstance.setPitch(1.0f)
+        }
+    }
+
+    internal fun sanitizeTextForSpeech(text: String): String {
+        if (text.isBlank()) return ""
+        return text
             .replace(Regex("\\[(CHART|TABLE|FLOWCHART|SCHEDULE)][\\s\\S]*?\\[/\\1]"), "")
+            // Markdown images and links: drop images, keep readable link label for links.
+            .replace(Regex("!\\[[^\\]]*]\\([^)]*\\)"), "")
+            .replace(Regex("\\[([^\\]]+)]\\([^)]*\\)"), "$1")
+            // Bare URLs (http/https or www.*) without touching dotted abbreviations like J.A.R.V.I.S or decimals.
+            .replace(Regex("https?://[^\\s)\\]>\"']+"), "")
+            .replace(Regex("\\bwww\\.[a-zA-Z0-9-]+(?:\\.[a-zA-Z0-9-]+)+(?:/[^\\s)\\]>\"']*)?"), "")
+            // Empty parentheses left behind if a URL was wrapped like "(https://...)".
+            .replace(Regex("\\(\\s*\\)"), "")
+            // Line-start Markdown/numbered list markers and blockquotes, plus inline bullet symbols.
+            .replace(Regex("(?m)^\\s*(?:[-*+>]+|\\d+[.)])\\s+"), "")
+            .replace(Regex("[•◦▪▫‣⁃]"), "")
             .replace(Regex("[*_`#]"), "")
+            // Normalize spacing introduced by removed URLs/markers while preserving line breaks.
+            .replace(Regex("[ \\t]{2,}"), " ")
+            .replace(Regex("(?m)^[ \\t]+|[ \\t]+$"), "")
+            .replace(Regex("\\n{3,}"), "\n\n")
             .trim()
             .take(1200)
-        if (clean.isEmpty()) return
+    }
+
+    fun speak(
+        text: String,
+        enableBargeIn: Boolean = false,
+        onBargeInDetected: (() -> Unit)? = null
+    ): Boolean {
+        if (text.isBlank()) return false
+        val ttsInstance = tts
+        if (!ttsReady || ttsInstance == null) {
+            _voiceError.value = "Text-to-speech is unavailable right now."
+            return false
+        }
+        val clean = sanitizeTextForSpeech(text)
+        if (clean.isEmpty()) return false
+
+        if (isListeningOrPending()) {
+            cancelListening()
+        }
+        stopBargeInMonitor()
 
         val utteranceId = UUID.randomUUID().toString()
+        utteranceInterruptedOrStopped = false
         activeUtteranceId = utteranceId
+        pendingBargeInCallback = if (enableBargeIn) onBargeInDetected else null
+
+        configureTtsForText(clean)
+        requestTtsAudioFocus()
+
         val params = if (ttsAudioSessionId > 0) {
             Bundle().apply {
                 putInt(TextToSpeech.Engine.KEY_PARAM_SESSION_ID, ttsAudioSessionId)
@@ -353,14 +835,24 @@ class VoiceController(private val context: Context) {
         } else {
             null
         }
-        val res = tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        val res = runCatching {
+            ttsInstance.speak(clean, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        }.getOrDefault(TextToSpeech.ERROR)
         if (res != TextToSpeech.SUCCESS) {
+            activeUtteranceId = null
+            pendingBargeInCallback = null
             finishSpeakingState()
+            _voiceError.value = "Couldn't play voice response."
+            return false
         }
+        return true
     }
 
-    fun stopSpeaking() {
+    fun stopSpeaking(interruptedByBargeIn: Boolean = false) {
+        utteranceInterruptedOrStopped = true
         activeUtteranceId = null
+        pendingBargeInCallback = null
+        stopBargeInMonitor()
         finishSpeakingState()
         try {
             tts?.stop()
@@ -368,11 +860,42 @@ class VoiceController(private val context: Context) {
         }
     }
 
-    fun release() {
+    internal fun triggerTestUtteranceCompletion(utteranceId: String) {
+        activeUtteranceId = utteranceId
+        utteranceInterruptedOrStopped = false
+        _isSpeaking.value = true
         activeUtteranceId = null
+        pendingBargeInCallback = null
+        finishSpeakingState()
+        _ttsNaturalCompletions.tryEmit(utteranceId)
+    }
+
+    internal fun triggerTestUtteranceFailure(utteranceId: String) {
+        activeUtteranceId = utteranceId
+        utteranceInterruptedOrStopped = false
+        _isSpeaking.value = true
+        handleUtteranceError(utteranceId)
+    }
+
+    internal fun setTtsReadyForTest(ready: Boolean) {
+        ttsReady = ready
+    }
+
+    internal fun simulateUtteranceStartForTest(utteranceId: String) {
+        activeUtteranceId = utteranceId
+        utteranceInterruptedOrStopped = false
+        _isSpeaking.value = true
+    }
+
+    fun release() {
+        utteranceInterruptedOrStopped = true
+        activeUtteranceId = null
+        pendingBargeInCallback = null
+        stopBargeInMonitor()
         stopSpeakingMeteringOnly()
+        abandonTtsAudioFocus()
+        cancelListening()
         try {
-            speechRecognizer?.destroy()
             tts?.shutdown()
         } catch (_: Exception) {
         }

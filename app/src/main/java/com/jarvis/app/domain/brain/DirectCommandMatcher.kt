@@ -72,6 +72,27 @@ object DirectCommandMatcher {
         if (Regex("^(clear|reset) (the )?chat$").matches(lower)) {
             return DirectActionMatch.ToolCall("control_interface", mapOf("action" to "clear_chat"))
         }
+        if (Regex("^(reset) (the )?(hud|theme|screen|customization)$").matches(lower)) {
+            return DirectActionMatch.ToolCall("customize_screen", mapOf("action" to "reset"))
+        }
+
+        // Direct device action commands (protected)
+        val uninstallApp = Regex("^uninstall (?:app )?([a-z0-9 ._-]{2,35})$", RegexOption.IGNORE_CASE).find(text)
+        if (uninstallApp != null) {
+            val appName = uninstallApp.groupValues[1].trim()
+            return DirectActionMatch.ToolCall("uninstall_app", mapOf("package" to appName))
+        }
+        val deleteFile = Regex("^delete file ([a-z0-9 ._/-]{2,50})$", RegexOption.IGNORE_CASE).find(text)
+        if (deleteFile != null) {
+            val fileName = deleteFile.groupValues[1].trim()
+            return DirectActionMatch.ToolCall("delete_file", mapOf("path" to fileName))
+        }
+        val sendMsg = Regex("^send message to ([a-z0-9 +_-]{2,30}) saying (.+)$", RegexOption.IGNORE_CASE).find(text)
+        if (sendMsg != null) {
+            val to = sendMsg.groupValues[1].trim()
+            val body = sendMsg.groupValues[2].trim()
+            return DirectActionMatch.ToolCall("send_message", mapOf("to" to to, "body" to body))
+        }
 
         // Quick Timer: "set a 5 minute timer" / "timer 30 seconds"
         val timerMin = Regex("^(?:set )?(?:a )?(\\d+)\\s*(?:min|minute|minutes)\\s*timer$").find(lower)

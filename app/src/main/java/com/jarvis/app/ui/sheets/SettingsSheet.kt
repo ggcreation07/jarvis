@@ -7,6 +7,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -15,18 +16,24 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -51,11 +58,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.jarvis.app.R
 import com.jarvis.app.data.ai.KeyCheckStatus
+import com.jarvis.app.data.ai.ModelListSource
+import com.jarvis.app.data.ai.ProviderModelsUiState
 import com.jarvis.app.data.security.SecureSecretStore
+import com.jarvis.app.domain.model.BYO_LLM_PROVIDER_IDS
 import com.jarvis.app.domain.model.OverlayType
 import com.jarvis.app.domain.model.PROVIDER_CATALOG
 import com.jarvis.app.ui.JarvisViewModel
@@ -71,12 +82,14 @@ fun SettingsSheet(
     val context = LocalContext.current
     val brain by viewModel.brainConfig.collectAsStateWithLifecycle()
     val keyStatuses by viewModel.keyStatuses.collectAsStateWithLifecycle()
+    val providerModels by viewModel.providerModels.collectAsStateWithLifecycle()
     val quotaSnapshots by viewModel.quotaSnapshots.collectAsStateWithLifecycle()
     val accessibilityEnabled by viewModel.accessibilityEnabled.collectAsStateWithLifecycle()
     val notificationEnabled by viewModel.notificationAccessEnabled.collectAsStateWithLifecycle()
     val telemetry by viewModel.telemetryState.collectAsStateWithLifecycle()
 
     var search by remember { mutableStateOf("") }
+    var modelSearch by remember(brain.activeProvider) { mutableStateOf("") }
     var pinnedCityInput by remember(brain.pinnedLocation) { mutableStateOf(brain.pinnedLocation) }
 
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -139,7 +152,7 @@ fun SettingsSheet(
                     )
                 }
 
-                if (matches("Intelligence AI Model Provider Gemini Firebase")) {
+                if (matches("Intelligence AI Model Provider Gemini Firebase OpenAI Anthropic Claude xAI Grok")) {
                     item {
                         SectionCard("Intelligence & Model Routing") {
                             Text(
@@ -154,33 +167,251 @@ fun SettingsSheet(
                                 PROVIDER_CATALOG.forEach { p ->
                                     FilterChip(
                                         selected = brain.activeProvider == p.id,
-                                        onClick = {
-                                            viewModel.updateBrain { it.copy(activeProvider = p.id, activeModel = p.defaultModel) }
-                                        },
+                                        onClick = { viewModel.selectProvider(p.id) },
                                         label = { Text(p.label.substringBefore(" (")) },
-                                        colors = hudFilterChipColors()
+                                        colors = hudFilterChipColors(),
+                                        modifier = Modifier.testTag("provider_chip_${p.id}")
                                     )
                                 }
                             }
-                            val currentProvider = PROVIDER_CATALOG.firstOrNull { it.id == brain.activeProvider } ?: PROVIDER_CATALOG.first()
-                            Row(
-                                modifier = Modifier.horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                currentProvider.models.forEach { m ->
-                                    FilterChip(
-                                        selected = brain.activeModel == m,
-                                        onClick = { viewModel.updateBrain { it.copy(activeModel = m) } },
-                                        label = { Text(m) },
-                                        colors = hudFilterChipColors()
+
+                            val currentProvider = PROVIDER_CATALOG.firstOrNull { it.id == brain.activeProvider }
+                                ?: PROVIDER_CATALOG.first()
+
+                            if (currentProvider.id !in BYO_LLM_PROVIDER_IDS) {
+                                Text(
+                                    "Built-in Firebase AI Logic Models",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = hud.textSecondary
+                                )
+                                Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    currentProvider.models.forEach { m ->
+                                        FilterChip(
+                                            selected = brain.activeModel == m,
+                                            onClick = { viewModel.selectModel(currentProvider.id, m) },
+                                            label = { Text(m) },
+                                            colors = hudFilterChipColors(),
+                                            modifier = Modifier.testTag("model_option_$m")
+                                        )
+                                    }
+                                }
+                            } else {
+                                val modelState = providerModels[currentProvider.id]
+                                    ?: ProviderModelsUiState(providerId = currentProvider.id)
+
+                                val (sourceLabel, sourceColor) = when (modelState.source) {
+                                    ModelListSource.LIVE -> "Live" to hud.success
+                                    ModelListSource.CACHED -> "Cached" to hud.warning
+                                    ModelListSource.NONE -> "Not fetched" to hud.textSecondary
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(
+                                        text = "${currentProvider.label.substringBefore(" (")} Models",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = hud.textPrimary,
+                                        modifier = Modifier.weight(1f)
                                     )
+                                    Text(
+                                        text = sourceLabel,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = sourceColor,
+                                        modifier = Modifier.testTag("models_source_badge")
+                                    )
+                                    OutlinedButton(
+                                        onClick = { viewModel.refreshModelsForProvider(currentProvider.id) },
+                                        enabled = !modelState.isLoading,
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                        modifier = Modifier
+                                            .heightIn(min = 48.dp)
+                                            .testTag("refresh_models_button")
+                                    ) {
+                                        Icon(
+                                            Icons.Rounded.Refresh,
+                                            contentDescription = "Refresh Models",
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(if (modelState.isLoading) "Refreshing…" else "Refresh Models")
+                                    }
+                                }
+
+                                if (modelState.isLoading) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        modifier = Modifier.testTag("models_loading_indicator")
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(16.dp),
+                                            strokeWidth = 2.dp,
+                                            color = hud.accent
+                                        )
+                                        Text(
+                                            "Fetching models from ${currentProvider.label.substringBefore(" (")}…",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = hud.textSecondary
+                                        )
+                                    }
+                                }
+
+                                if (!modelState.error.isNullOrBlank()) {
+                                    Text(
+                                        text = if (modelState.models.isNotEmpty() && modelState.source == ModelListSource.CACHED) {
+                                            "Showing cached list — ${modelState.error}"
+                                        } else {
+                                            modelState.error
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (modelState.models.isNotEmpty()) hud.warning else hud.danger,
+                                        modifier = Modifier.testTag("models_error_text")
+                                    )
+                                }
+
+                                val selectedId = brain.activeModel.trim()
+                                val isSelectedMissing = selectedId.isNotEmpty() &&
+                                    modelState.models.isNotEmpty() &&
+                                    modelState.models.none { it.id == selectedId }
+
+                                if (isSelectedMissing) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(hud.danger.copy(alpha = 0.12f))
+                                            .border(1.dp, hud.danger.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
+                                            .padding(10.dp)
+                                            .testTag("model_unavailable_banner"),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Text(
+                                            text = "Model Unavailable: $selectedId",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = hud.danger
+                                        )
+                                        Text(
+                                            text = "Please select another available model below.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = hud.textPrimary
+                                        )
+                                    }
+                                } else if (selectedId.isNotEmpty()) {
+                                    Text(
+                                        text = "Selected model: $selectedId",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = hud.accent
+                                    )
+                                } else if (modelState.models.isNotEmpty()) {
+                                    Text(
+                                        text = "No model selected. Tap a model below to use it.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = hud.warning
+                                    )
+                                }
+
+                                if (modelState.models.isEmpty() && !modelState.isLoading) {
+                                    Text(
+                                        text = "No models loaded yet. Save a valid API key below and tap Refresh Models.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = hud.textSecondary,
+                                        modifier = Modifier.testTag("models_empty_text")
+                                    )
+                                } else if (modelState.models.isNotEmpty()) {
+                                    if (modelState.models.size > 6) {
+                                        OutlinedTextField(
+                                            value = modelSearch,
+                                            onValueChange = { modelSearch = it },
+                                            placeholder = { Text("Filter models…") },
+                                            singleLine = true,
+                                            colors = hudTextFieldColors(),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .testTag("model_filter_input")
+                                        )
+                                    }
+                                    val filteredModels = remember(modelState.models, modelSearch) {
+                                        val q = modelSearch.trim()
+                                        if (q.isEmpty()) {
+                                            modelState.models
+                                        } else {
+                                            modelState.models.filter {
+                                                it.id.contains(q, ignoreCase = true) ||
+                                                    it.displayName.contains(q, ignoreCase = true)
+                                            }
+                                        }
+                                    }
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .heightIn(max = 220.dp)
+                                            .verticalScroll(rememberScrollState()),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        filteredModels.forEach { m ->
+                                            val isSelected = brain.activeModel == m.id
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .heightIn(min = 48.dp)
+                                                    .clip(RoundedCornerShape(10.dp))
+                                                    .background(
+                                                        if (isSelected) hud.accent.copy(alpha = 0.16f)
+                                                        else hud.surfacePanel
+                                                    )
+                                                    .border(
+                                                        width = 1.dp,
+                                                        color = if (isSelected) hud.accent else hud.borderSubtle,
+                                                        shape = RoundedCornerShape(10.dp)
+                                                    )
+                                                    .clickable { viewModel.selectModel(currentProvider.id, m.id) }
+                                                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                                                    .testTag("model_option_${m.id}"),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = m.id,
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = if (isSelected) hud.accent else hud.textPrimary,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                    if (m.displayName.isNotBlank() && m.displayName != m.id) {
+                                                        Text(
+                                                            text = m.displayName,
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            color = hud.textSecondary,
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis
+                                                        )
+                                                    }
+                                                }
+                                                if (isSelected) {
+                                                    Icon(
+                                                        Icons.Rounded.Check,
+                                                        contentDescription = "Selected",
+                                                        tint = hud.accent,
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                if (matches("API Keys Encrypted Keystore Groq OpenRouter NVIDIA Mistral Tavily")) {
+                if (matches("API Keys Encrypted Keystore Groq OpenRouter NVIDIA Mistral OpenAI Anthropic Claude xAI Grok Tavily")) {
                     item {
                         SectionCard("Optional BYO API Keys (Keystore Encrypted)") {
                             val entries = listOf(
@@ -189,6 +420,9 @@ fun SettingsSheet(
                                 Triple(SecureSecretStore.KEY_OPENROUTER, "openrouter", "OpenRouter API Key"),
                                 Triple(SecureSecretStore.KEY_NVIDIA, "nvidia", "NVIDIA NIM API Key"),
                                 Triple(SecureSecretStore.KEY_MISTRAL, "mistral", "Mistral API Key"),
+                                Triple(SecureSecretStore.KEY_OPENAI, "openai", "OpenAI API Key"),
+                                Triple(SecureSecretStore.KEY_ANTHROPIC, "anthropic", "Anthropic Claude API Key"),
+                                Triple(SecureSecretStore.KEY_XAI, "xai", "xAI Grok API Key"),
                                 Triple(SecureSecretStore.KEY_TAVILY, "tavily", "Tavily Search API Key")
                             )
                             entries.forEach { (secretKey, providerId, label) ->
@@ -466,10 +700,20 @@ private fun ApiKeyEntryRow(
 
     val (badgeLabel, badgeColor) = when (status) {
         KeyCheckStatus.EMPTY -> "Not added" to hud.textSecondary
+        KeyCheckStatus.NOT_VERIFIED -> "Not verified" to hud.textSecondary
         KeyCheckStatus.CHECKING -> "Checking…" to hud.warning
         KeyCheckStatus.WORKING -> "Working" to hud.success
+        KeyCheckStatus.INVALID_KEY -> "Invalid Key" to hud.danger
+        KeyCheckStatus.PERMISSION_DENIED -> "Permission Denied" to hud.danger
+        KeyCheckStatus.QUOTA_EXCEEDED -> "Quota Exceeded" to hud.warning
+        KeyCheckStatus.RATE_LIMITED -> "Rate Limited" to hud.warning
+        KeyCheckStatus.NETWORK_ERROR -> "Network Error" to hud.danger
+        KeyCheckStatus.GENERATION_UNAVAILABLE -> "Unavailable" to hud.warning
+        KeyCheckStatus.SERVER_ERROR -> "Server Error" to hud.danger
+        @Suppress("DEPRECATION")
         KeyCheckStatus.REJECTED -> "Rejected" to hud.danger
-        KeyCheckStatus.UNVERIFIED -> "Saved" to hud.accent
+        @Suppress("DEPRECATION")
+        KeyCheckStatus.UNVERIFIED -> "Not verified" to hud.textSecondary
     }
 
     Column(

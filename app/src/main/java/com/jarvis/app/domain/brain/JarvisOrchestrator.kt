@@ -3,12 +3,15 @@ package com.jarvis.app.domain.brain
 import android.graphics.Bitmap
 import com.jarvis.app.data.ai.AiStreamEvent
 import com.jarvis.app.data.ai.ByoAiClient
+import com.jarvis.app.data.ai.ByoStreamEvent
 import com.jarvis.app.data.ai.FirebaseAiService
 import com.jarvis.app.data.local.ConfigStore
 import com.jarvis.app.data.local.JarvisRepository
 import com.jarvis.app.data.security.SecureSecretStore
+import com.jarvis.app.domain.model.BYO_LLM_PROVIDER_IDS
 import com.jarvis.app.domain.model.BrainConfig
 import com.jarvis.app.domain.model.ChatMessageItem
+import com.jarvis.app.domain.model.FIREBASE_AI_MODELS
 import com.jarvis.app.domain.model.JARVIS_AGENTS
 import com.jarvis.app.domain.model.TaskRecordItem
 import com.jarvis.app.domain.model.ToolActivityItem
@@ -197,12 +200,21 @@ class JarvisOrchestrator(
         // 3. Check if user explicitly selected a BYO provider with a stored key
         val provider = brainConfig.activeProvider
         if (provider !in setOf("auto", "firebase_ai")) {
+            if (provider !in BYO_LLM_PROVIDER_IDS) {
+                val msg = "Unsupported provider '$provider'. Select a valid provider in Settings -> Intelligence & Model Routing."
+                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+                emit(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
+                return@flow
+            }
             val keyName = when (provider) {
                 "groq" -> SecureSecretStore.KEY_GROQ
                 "gemini" -> SecureSecretStore.KEY_GEMINI
                 "openrouter" -> SecureSecretStore.KEY_OPENROUTER
                 "nvidia" -> SecureSecretStore.KEY_NVIDIA
                 "mistral" -> SecureSecretStore.KEY_MISTRAL
+                "openai" -> SecureSecretStore.KEY_OPENAI
+                "anthropic" -> SecureSecretStore.KEY_ANTHROPIC
+                "xai" -> SecureSecretStore.KEY_XAI
                 else -> ""
             }
             val userKey = if (keyName.isNotBlank()) secretStore.getSecret(keyName) else ""
@@ -212,11 +224,51 @@ class JarvisOrchestrator(
                 emit(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
                 return@flow
             }
+            if (attachedBitmap != null) {
+                val msg = "Image attachments require Auto / Firebase AI Logic (built-in). Switch provider or remove the image attachment."
+                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+                emit(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
+                return@flow
+            }
+            val selectedModel = brainConfig.activeModel.trim()
+            if (selectedModel.isEmpty()) {
+                val msg = "No model selected for $provider. Open Settings -> Intelligence & Model Routing to fetch and select a model."
+                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+                emit(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
+                return@flow
+            }
+            val cached = configStore.loadProviderModelsCache(provider)
+            if (cached != null && cached.models.isNotEmpty() && cached.models.none { it.id == selectedModel }) {
+                val msg = "Selected model '$selectedModel' is unavailable for $provider. Please open Settings and select another model."
+                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+                emit(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
+                return@flow
+            }
             try {
-                val reply = if (provider == "gemini") {
-                    byoAiClient.chatDirectGeminiRest(userKey, brainConfig.activeModel, systemPrompt, priorTurns, cleanInput)
-                } else {
-                    byoAiClient.chatOpenAiCompatible(provider, userKey, brainConfig.activeModel, systemPrompt, priorTurns, cleanInput)
+                val reply = when (provider) {
+                    "gemini" -> byoAiClient.chatDirectGeminiRest(userKey, selectedModel, systemPrompt, priorTurns, cleanInput)
+                    "anthropic" -> {
+                        var completed = ""
+                        byoAiClient.streamAnthropicMessages(userKey, selectedModel, systemPrompt, priorTurns, cleanInput)
+                            .collect { event ->
+                                when (event) {
+                                    is ByoStreamEvent.PartialText -> emit(TurnProgressEvent.StreamingText(event.accumulated))
+                                    is ByoStreamEvent.Completed -> completed = event.finalText
+                                }
+                            }
+                        completed.ifBlank { "No text returned." }
+                    }
+                    else -> {
+                        var completed = ""
+                        byoAiClient.streamOpenAiCompatible(provider, userKey, selectedModel, systemPrompt, priorTurns, cleanInput)
+                            .collect { event ->
+                                when (event) {
+                                    is ByoStreamEvent.PartialText -> emit(TurnProgressEvent.StreamingText(event.accumulated))
+                                    is ByoStreamEvent.Completed -> completed = event.finalText
+                                }
+                            }
+                        completed.ifBlank { "No text returned." }
+                    }
                 }
                 repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "succeeded", agentId, 1, reply.take(160)))
                 emit(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
@@ -224,7 +276,8 @@ class JarvisOrchestrator(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val errMsg = e.localizedMessage ?: "$provider request failed."
+                val rawErr = e.localizedMessage ?: "$provider request failed."
+                val errMsg = byoAiClient.sanitizeSecret(rawErr, userKey)
                 repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, errMsg))
                 emit(TurnProgressEvent.Finished(errMsg, agentId, emptyList(), isError = true))
                 return@flow
@@ -232,6 +285,12 @@ class JarvisOrchestrator(
         }
 
         // 4. Default & Primary: Built-in Firebase AI Logic with tool calling + streaming
+        if (brainConfig.activeModel !in FIREBASE_AI_MODELS) {
+            val msg = "Model '${brainConfig.activeModel}' is not available on built-in Firebase AI Logic. Select a Firebase AI model in Settings."
+            repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+            emit(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
+            return@flow
+        }
         try {
             var finalReply = ""
             val confirmationPendingCalls = mutableListOf<String>()

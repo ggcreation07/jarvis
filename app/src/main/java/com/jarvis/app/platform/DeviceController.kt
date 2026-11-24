@@ -385,6 +385,68 @@ class DeviceController(private val context: Context) {
         }
     }
 
+    fun deleteGrantedFile(treeUriStr: String, fileName: String): ActionOutcome {
+        if (treeUriStr.isBlank()) {
+            return ActionOutcome(false, "No folder granted yet. Pick a folder in Settings -> Files first.")
+        }
+        return try {
+            val treeUri = Uri.parse(treeUriStr)
+            val docId = DocumentsContract.getTreeDocumentId(treeUri)
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+            var matchedDocId: String? = null
+            var matchedName = fileName
+            context.contentResolver.query(
+                childrenUri,
+                arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                val idCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                while (cursor.moveToNext()) {
+                    val name = cursor.getString(nameCol)
+                    if (name.equals(fileName, ignoreCase = true) || name.contains(fileName, ignoreCase = true)) {
+                        matchedDocId = cursor.getString(idCol)
+                        matchedName = name
+                        break
+                    }
+                }
+            }
+            val id = matchedDocId ?: return ActionOutcome(false, "File \"$fileName\" wasn't found in your granted folder.")
+            val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
+            val deleted = DocumentsContract.deleteDocument(context.contentResolver, fileUri)
+            if (deleted) ActionOutcome(true, "Deleted file \"$matchedName\" from granted folder.")
+            else ActionOutcome(false, "Could not delete file \"$matchedName\".")
+        } catch (e: Exception) {
+            ActionOutcome(false, "Couldn't delete file: ${e.message}")
+        }
+    }
+
+    fun requestUninstallApplication(nameOrPackage: String): ActionOutcome {
+        val query = nameOrPackage.trim()
+        if (query.isEmpty()) return ActionOutcome(false, "Tell me which app to uninstall.")
+        val pm = context.packageManager
+        val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val apps = pm.queryIntentActivities(mainIntent, 0)
+        val match = apps.firstOrNull {
+            val label = it.loadLabel(pm).toString()
+            label.equals(query, ignoreCase = true) || it.activityInfo.packageName.equals(query, ignoreCase = true)
+        } ?: apps.firstOrNull {
+            val label = it.loadLabel(pm).toString()
+            label.contains(query, ignoreCase = true)
+        }
+        val targetPkg = match?.activityInfo?.packageName ?: query
+        return try {
+            val intent = Intent(Intent.ACTION_UNINSTALL_PACKAGE, Uri.parse("package:$targetPkg"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            ActionOutcome(true, "Prompted uninstallation for ${match?.loadLabel(pm) ?: targetPkg}.")
+        } catch (e: Exception) {
+            ActionOutcome(false, "Couldn't prompt uninstall: ${e.message}")
+        }
+    }
+
     fun hasCalendarPermission(): Boolean {
         return ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED
     }

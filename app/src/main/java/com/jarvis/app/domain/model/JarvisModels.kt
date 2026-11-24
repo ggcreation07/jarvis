@@ -118,8 +118,9 @@ data class ScreenConfig(
 @Immutable
 @Serializable
 data class BrainConfig(
-    val activeProvider: String = "auto", // "auto" | "firebase_ai" | "groq" | "gemini" | "openrouter" | "nvidia" | "mistral"
+    val activeProvider: String = "auto", // "auto" | "firebase_ai" | "groq" | "gemini" | "openrouter" | "nvidia" | "mistral" | "openai" | "anthropic" | "xai"
     val activeModel: String = "gemini-3.8-flash",
+    val providerModels: Map<String, String> = emptyMap(),
     val conversationMode: Boolean = false,
     val agentsMode: Boolean = false,
     val selectedAgentId: String = "auto",
@@ -380,12 +381,29 @@ data class ProviderOption(
     val requiresKey: Boolean
 )
 
+val FIREBASE_AI_MODELS = listOf(
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-4-argon"
+)
+
+val BYO_LLM_PROVIDER_IDS = setOf(
+    "groq",
+    "gemini",
+    "openrouter",
+    "nvidia",
+    "mistral",
+    "openai",
+    "anthropic",
+    "xai"
+)
+
 val PROVIDER_CATALOG = listOf(
     ProviderOption(
         id = "auto",
         label = "Auto (Firebase AI + BYO Keys)",
         defaultModel = "gemini-3.8-flash",
-        models = listOf("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-4-argon"),
+        models = FIREBASE_AI_MODELS,
         description = "Uses built-in Firebase AI Logic first and seamlessly uses any optional BYO keys you add.",
         requiresKey = false
     ),
@@ -393,48 +411,72 @@ val PROVIDER_CATALOG = listOf(
         id = "firebase_ai",
         label = "Firebase AI Logic (Built-in)",
         defaultModel = "gemini-3.8-flash",
-        models = listOf("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-4-argon"),
+        models = FIREBASE_AI_MODELS,
         description = "Built-in Gemini models protected by App Check. No API key needed.",
         requiresKey = false
     ),
     ProviderOption(
         id = "groq",
         label = "Groq (BYO Key)",
-        defaultModel = "llama-3.3-70b-versatile",
-        models = listOf("llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3-32b"),
+        defaultModel = "",
+        models = emptyList(),
         description = "Ultra-fast inference using your own Groq API key.",
         requiresKey = true
     ),
     ProviderOption(
         id = "gemini",
         label = "Google AI Studio (BYO Key)",
-        defaultModel = "gemini-2.5-flash",
-        models = listOf("gemini-2.5-flash", "gemini-2.5-pro"),
+        defaultModel = "",
+        models = emptyList(),
         description = "Direct Gemini REST endpoint using your personal AI Studio key.",
         requiresKey = true
     ),
     ProviderOption(
         id = "openrouter",
         label = "OpenRouter (BYO Key)",
-        defaultModel = "google/gemini-2.5-flash",
-        models = listOf("google/gemini-2.5-flash", "anthropic/claude-3.5-sonnet", "openai/gpt-4o-mini"),
+        defaultModel = "",
+        models = emptyList(),
         description = "Multi-model router using your own OpenRouter key.",
         requiresKey = true
     ),
     ProviderOption(
         id = "nvidia",
         label = "NVIDIA NIM (BYO Key)",
-        defaultModel = "meta/llama-3.3-70b-instruct",
-        models = listOf("meta/llama-3.3-70b-instruct", "deepseek-ai/deepseek-r1"),
+        defaultModel = "",
+        models = emptyList(),
         description = "NVIDIA hosted endpoints using your NVIDIA API key.",
         requiresKey = true
     ),
     ProviderOption(
         id = "mistral",
         label = "Mistral AI (BYO Key)",
-        defaultModel = "mistral-small-latest",
-        models = listOf("mistral-small-latest", "mistral-large-latest"),
+        defaultModel = "",
+        models = emptyList(),
         description = "Mistral AI models using your own Mistral API key.",
+        requiresKey = true
+    ),
+    ProviderOption(
+        id = "openai",
+        label = "OpenAI (BYO Key)",
+        defaultModel = "",
+        models = emptyList(),
+        description = "Direct OpenAI chat completions using your own OpenAI API key.",
+        requiresKey = true
+    ),
+    ProviderOption(
+        id = "anthropic",
+        label = "Anthropic Claude (BYO Key)",
+        defaultModel = "",
+        models = emptyList(),
+        description = "Direct Anthropic Claude Messages API using your own Anthropic API key.",
+        requiresKey = true
+    ),
+    ProviderOption(
+        id = "xai",
+        label = "xAI Grok (BYO Key)",
+        defaultModel = "",
+        models = emptyList(),
+        description = "Direct xAI Grok chat completions using your own xAI API key.",
         requiresKey = true
     )
 )

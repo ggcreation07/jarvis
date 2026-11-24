@@ -9,8 +9,11 @@ import android.net.Uri
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.jarvis.app.data.ai.ByoAiClient
+import com.jarvis.app.data.ai.FetchModelsResult
 import com.jarvis.app.data.ai.FirebaseAiService
 import com.jarvis.app.data.ai.KeyCheckStatus
+import com.jarvis.app.data.ai.ModelListSource
+import com.jarvis.app.data.ai.ProviderModelsUiState
 import com.jarvis.app.data.ai.QuotaUsageSnapshot
 import com.jarvis.app.data.local.ConfigStore
 import com.jarvis.app.data.local.JarvisDatabase
@@ -24,9 +27,11 @@ import com.jarvis.app.domain.brain.TurnProgressEvent
 import com.jarvis.app.domain.model.ActionLogItem
 import com.jarvis.app.domain.model.AgendaItem
 import com.jarvis.app.domain.model.ArchivedThreadSummary
+import com.jarvis.app.domain.model.BYO_LLM_PROVIDER_IDS
 import com.jarvis.app.domain.model.BrainConfig
 import com.jarvis.app.domain.model.ChatMessageItem
 import com.jarvis.app.domain.model.CustomLookPreset
+import com.jarvis.app.domain.model.FIREBASE_AI_MODELS
 import com.jarvis.app.domain.model.FactItem
 import com.jarvis.app.domain.model.HandPose
 import com.jarvis.app.domain.model.HandsFreeActivity
@@ -44,6 +49,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -53,6 +59,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class JarvisAssistantRuntime private constructor(appContext: Context) {
 
@@ -211,6 +219,9 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     private val _keyStatuses = MutableStateFlow<Map<String, KeyCheckStatus>>(emptyMap())
     val keyStatuses: StateFlow<Map<String, KeyCheckStatus>> = _keyStatuses.asStateFlow()
 
+    private val _providerModels = MutableStateFlow<Map<String, ProviderModelsUiState>>(emptyMap())
+    val providerModels: StateFlow<Map<String, ProviderModelsUiState>> = _providerModels.asStateFlow()
+
     private val _quotaSnapshots = MutableStateFlow<List<QuotaUsageSnapshot>>(emptyList())
     val quotaSnapshots: StateFlow<List<QuotaUsageSnapshot>> = _quotaSnapshots.asStateFlow()
 
@@ -231,6 +242,8 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
 
     private var activeTurnJob: Job? = null
     private var followUpListenJob: Job? = null
+    @Volatile
+    private var activeTurnToken: Long = 0L
 
     @Volatile
     private var lastTurnInitiatedByVoice: Boolean = false
@@ -239,6 +252,8 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     private var allowAutoFollowUpForCurrentTurn: Boolean = true
 
     private var consecutiveVoiceErrors: Int = 0
+
+    internal var byoAiClientOverride: ByoAiClient? = null
 
     internal var turnExecutorOverride: (
         (
@@ -260,6 +275,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
             refreshServiceStatus()
             refreshTelemetryAndWeather()
             refreshKeyStatuses()
+            loadCachedProviderModels()
             refreshCalendarIfEnabled()
         }
         runtimeScope.launch {
@@ -304,13 +320,14 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         }
     }
 
-    private fun scheduleFollowUpListening(delayMs: Long = 420L) {
+    private fun scheduleFollowUpListening(delayMs: Long = 420L, token: Long = activeTurnToken) {
         followUpListenJob?.cancel()
-        if (!_isVoiceSessionActive.value || brainConfig.value.muted) return
+        if (!_isVoiceSessionActive.value || brainConfig.value.muted || activeTurnToken != token) return
         followUpListenJob = runtimeScope.launch {
             delay(delayMs)
             followUpListenJob = null
-            if (_isVoiceSessionActive.value &&
+            if (activeTurnToken == token &&
+                _isVoiceSessionActive.value &&
                 !_isBusy.value &&
                 !voiceController.isListeningOrPending() &&
                 !voiceController.isSpeaking.value &&
@@ -447,17 +464,20 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         lastTurnInitiatedByVoice = initiatedByVoice
         followUpListenJob?.cancel()
         activeTurnJob?.cancel()
+        val token = ++activeTurnToken
         activeTurnJob = runtimeScope.launch {
             var nextPrompt: String? = finalPrompt
             var nextAttached: Pair<String, Bitmap>? = attached
             var depth = 0
-            while (nextPrompt != null) {
+            while (nextPrompt != null && activeTurnToken == token) {
                 val queuedRoutine = executeSingleTurn(
                     prompt = nextPrompt,
                     attached = nextAttached,
                     initiatedByVoice = initiatedByVoice,
-                    canChainRoutine = depth < MAX_ROUTINE_CHAIN_DEPTH
+                    canChainRoutine = depth < MAX_ROUTINE_CHAIN_DEPTH,
+                    token = token
                 )
+                if (activeTurnToken != token) break
                 nextPrompt = queuedRoutine?.takeIf { it.isNotBlank() }
                 nextAttached = null
                 depth += 1
@@ -469,8 +489,10 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         prompt: String,
         attached: Pair<String, Bitmap>?,
         initiatedByVoice: Boolean,
-        canChainRoutine: Boolean
+        canChainRoutine: Boolean,
+        token: Long
     ): String? {
+        if (activeTurnToken != token) return null
         _isBusy.value = true
         val cfg = brainConfig.value
         val userMsg = ChatMessageItem(
@@ -480,7 +502,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
             attachmentLabel = attached?.first.orEmpty()
         )
         repository.addTurn(userMsg)
-        if (attached != null) {
+        if (attached != null && activeTurnToken == token) {
             _attachedImage.value = null
         }
 
@@ -492,12 +514,14 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         var pendingRoutinePrompt: String? = null
         var turnFinished = false
 
-        _streamingMessage.value = ChatMessageItem(
-            role = "assistant",
-            content = "",
-            agentId = activeAgent,
-            isStreaming = true
-        )
+        if (activeTurnToken == token) {
+            _streamingMessage.value = ChatMessageItem(
+                role = "assistant",
+                content = "",
+                agentId = activeAgent,
+                isStreaming = true
+            )
+        }
 
         val turnFlow = turnExecutorOverride?.invoke(
             prompt,
@@ -515,43 +539,54 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
 
         try {
             turnFlow.collect { event ->
+                if (activeTurnToken != token) return@collect
                 when (event) {
                     is TurnProgressEvent.AgentSelected -> {
                         activeAgent = event.agentId
-                        _streamingMessage.value = _streamingMessage.value?.copy(agentId = activeAgent)
+                        if (activeTurnToken == token) {
+                            _streamingMessage.value = _streamingMessage.value?.copy(agentId = activeAgent)
+                        }
                     }
                     is TurnProgressEvent.ToolActivitiesUpdated -> {
                         latestActivities = event.activities
-                        _streamingMessage.value = _streamingMessage.value?.copy(toolActivities = latestActivities)
+                        if (activeTurnToken == token) {
+                            _streamingMessage.value = _streamingMessage.value?.copy(toolActivities = latestActivities)
+                        }
                     }
                     is TurnProgressEvent.StreamingText -> {
-                        _streamingMessage.value = _streamingMessage.value?.copy(content = event.text)
+                        if (activeTurnToken == token) {
+                            _streamingMessage.value = _streamingMessage.value?.copy(content = event.text)
+                        }
                     }
                     is TurnProgressEvent.SideEffect -> {
-                        val eff = event.effect
-                        eff.openOverlay?.let { _activeOverlay.value = it }
-                        if (eff.clearChat) repository.clearCurrentChatWithoutArchiving()
-                        eff.generatedBitmap?.let { bmp ->
-                            val key = "img_${System.currentTimeMillis()}"
-                            generatedImgKey = key
-                            _generatedBitmaps.value = _generatedBitmaps.value + (key to bmp)
-                        }
-                        eff.qrBitmap?.let { bmp ->
-                            val key = "qr_${System.currentTimeMillis()}"
-                            generatedImgKey = key
-                            generatedQrText = eff.qrText
-                            _generatedBitmaps.value = _generatedBitmaps.value + (key to bmp)
-                        }
-                        eff.runRoutinePrompt?.let { rPrompt ->
-                            if (canChainRoutine && rPrompt.isNotBlank() && pendingRoutinePrompt == null) {
-                                pendingRoutinePrompt = rPrompt.trim()
+                        if (activeTurnToken == token) {
+                            val eff = event.effect
+                            eff.openOverlay?.let { _activeOverlay.value = it }
+                            if (eff.clearChat) repository.clearCurrentChatWithoutArchiving()
+                            eff.generatedBitmap?.let { bmp ->
+                                val key = "img_${System.currentTimeMillis()}"
+                                generatedImgKey = key
+                                _generatedBitmaps.value = _generatedBitmaps.value + (key to bmp)
+                            }
+                            eff.qrBitmap?.let { bmp ->
+                                val key = "qr_${System.currentTimeMillis()}"
+                                generatedImgKey = key
+                                generatedQrText = eff.qrText
+                                _generatedBitmaps.value = _generatedBitmaps.value + (key to bmp)
+                            }
+                            eff.runRoutinePrompt?.let { rPrompt ->
+                                if (canChainRoutine && rPrompt.isNotBlank() && pendingRoutinePrompt == null) {
+                                    pendingRoutinePrompt = rPrompt.trim()
+                                }
                             }
                         }
                     }
                     is TurnProgressEvent.Finished -> {
-                        if (turnFinished) return@collect
+                        if (turnFinished || activeTurnToken != token) return@collect
                         turnFinished = true
-                        _streamingMessage.value = null
+                        if (activeTurnToken == token) {
+                            _streamingMessage.value = null
+                        }
                         val willChainRoutine = !event.isError && !pendingRoutinePrompt.isNullOrBlank()
                         val finalMsg = ChatMessageItem(
                             role = "assistant",
@@ -566,58 +601,71 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
                         _quotaSnapshots.value = byoAiClient.allQuotaSnapshots()
 
                         if (!willChainRoutine) {
-                            handleTurnCompletedOutput(
-                                replyText = event.replyText,
-                                isError = event.isError,
-                                initiatedByVoice = initiatedByVoice,
-                                cfg = cfg
-                            )
-                            _isBusy.value = false
+                            if (activeTurnToken == token) {
+                                handleTurnCompletedOutput(
+                                    replyText = event.replyText,
+                                    isError = event.isError,
+                                    initiatedByVoice = initiatedByVoice,
+                                    cfg = cfg,
+                                    token = token
+                                )
+                                _isBusy.value = false
+                            }
                         } else {
-                            _isBusy.value = true
+                            if (activeTurnToken == token) {
+                                _isBusy.value = true
+                            }
                         }
                     }
                 }
             }
 
             if (!turnFinished) {
-                _streamingMessage.value = null
-                handleTurnCompletedOutput(
-                    replyText = "Sorry, I couldn't complete that request. Please try again.",
-                    isError = true,
-                    initiatedByVoice = initiatedByVoice,
-                    cfg = cfg
-                )
-                _isBusy.value = false
+                if (activeTurnToken == token) {
+                    _streamingMessage.value = null
+                    handleTurnCompletedOutput(
+                        replyText = "Sorry, I couldn't complete that request. Please try again.",
+                        isError = true,
+                        initiatedByVoice = initiatedByVoice,
+                        cfg = cfg,
+                        token = token
+                    )
+                    _isBusy.value = false
+                }
                 return null
             }
             return pendingRoutinePrompt
         } catch (e: CancellationException) {
-            _streamingMessage.value = null
-            _isBusy.value = false
+            if (activeTurnToken == token) {
+                _streamingMessage.value = null
+                _isBusy.value = false
+            }
             throw e
         } catch (e: Exception) {
-            _streamingMessage.value = null
-            val errMsg = e.localizedMessage?.takeIf { it.isNotBlank() }
-                ?: "Sorry, something went wrong while processing that request."
-            runCatching {
-                repository.addTurn(
-                    ChatMessageItem(
-                        role = "assistant",
-                        content = errMsg,
-                        agentId = activeAgent,
-                        toolActivities = latestActivities,
-                        isError = true
+            if (activeTurnToken == token) {
+                _streamingMessage.value = null
+                val errMsg = e.localizedMessage?.takeIf { it.isNotBlank() }
+                    ?: "Sorry, something went wrong while processing that request."
+                runCatching {
+                    repository.addTurn(
+                        ChatMessageItem(
+                            role = "assistant",
+                            content = errMsg,
+                            agentId = activeAgent,
+                            toolActivities = latestActivities,
+                            isError = true
+                        )
                     )
+                }
+                handleTurnCompletedOutput(
+                    replyText = errMsg,
+                    isError = true,
+                    initiatedByVoice = initiatedByVoice,
+                    cfg = cfg,
+                    token = token
                 )
+                _isBusy.value = false
             }
-            handleTurnCompletedOutput(
-                replyText = errMsg,
-                isError = true,
-                initiatedByVoice = initiatedByVoice,
-                cfg = cfg
-            )
-            _isBusy.value = false
             return null
         }
     }
@@ -626,8 +674,10 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         replyText: String,
         isError: Boolean,
         initiatedByVoice: Boolean,
-        cfg: BrainConfig
+        cfg: BrainConfig,
+        token: Long
     ) {
+        if (activeTurnToken != token) return
         val isVoiceContext = _isVoiceSessionActive.value || initiatedByVoice
         if (!isError) {
             consecutiveVoiceErrors = 0
@@ -643,12 +693,12 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
                     if (isVoiceContext && (!voiceController.isTtsReady() || voiceController.voiceError.value != null)) {
                         _bannerMessage.value = voiceController.voiceError.value ?: "Voice playback unavailable."
                     }
-                    if (_isVoiceSessionActive.value && !cfg.muted) {
-                        scheduleFollowUpListening()
+                    if (_isVoiceSessionActive.value && !cfg.muted && activeTurnToken == token) {
+                        scheduleFollowUpListening(token = token)
                     }
                 }
-            } else if (_isVoiceSessionActive.value && !cfg.muted) {
-                scheduleFollowUpListening()
+            } else if (_isVoiceSessionActive.value && !cfg.muted && activeTurnToken == token) {
+                scheduleFollowUpListening(token = token)
             }
             return
         }
@@ -673,11 +723,11 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
                 enableBargeIn = canAutoRearm && hasRecordAudioPermission(),
                 onBargeInDetected = { handleVoiceBargeIn() }
             )
-            if (!spoke && canAutoRearm) {
-                scheduleFollowUpListening()
+            if (!spoke && canAutoRearm && activeTurnToken == token) {
+                scheduleFollowUpListening(token = token)
             }
-        } else if (canAutoRearm) {
-            scheduleFollowUpListening()
+        } else if (canAutoRearm && activeTurnToken == token) {
+            scheduleFollowUpListening(token = token)
         }
     }
 
@@ -718,6 +768,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
 
     fun stopCurrentWork() {
         followUpListenJob?.cancel()
+        activeTurnToken++
         activeTurnJob?.cancel()
         allowAutoFollowUpForCurrentTurn = false
         consecutiveVoiceErrors = 0
@@ -1045,46 +1096,221 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         updateScreen { ScreenConfig(quickStartCompleted = it.quickStartCompleted) }
     }
 
-    fun updateBrain(transform: (BrainConfig) -> BrainConfig) {
-        runtimeScope.launch { configStore.updateBrainConfig(transform) }
-    }
+    private val brainUpdateMutex = Mutex()
 
-    fun toggleMute() {
+    fun updateBrain(transform: (BrainConfig) -> BrainConfig) {
         runtimeScope.launch {
-            configStore.updateBrainConfig { cur ->
-                val nextMuted = !cur.muted
-                if (nextMuted) {
-                    followUpListenJob?.cancel()
-                    allowAutoFollowUpForCurrentTurn = false
-                    voiceController.stopSpeaking()
-                }
-                cur.copy(muted = nextMuted)
+            brainUpdateMutex.withLock {
+                configStore.updateBrainConfig(transform)
             }
         }
     }
 
-    fun refreshKeyStatuses() {
+    fun toggleMute() {
         runtimeScope.launch {
+            brainUpdateMutex.withLock {
+                configStore.updateBrainConfig { cur ->
+                    val nextMuted = !cur.muted
+                    if (nextMuted) {
+                        followUpListenJob?.cancel()
+                        allowAutoFollowUpForCurrentTurn = false
+                        voiceController.stopSpeaking()
+                    }
+                    cur.copy(muted = nextMuted)
+                }
+            }
+        }
+    }
+
+    private val pendingKeyVerifications = java.util.concurrent.ConcurrentHashMap<String, Job>()
+    private val pendingModelFetches = java.util.concurrent.ConcurrentHashMap<String, Job>()
+
+    private fun secretKeyForProvider(providerId: String): String = when (providerId) {
+        "groq" -> SecureSecretStore.KEY_GROQ
+        "gemini" -> SecureSecretStore.KEY_GEMINI
+        "openrouter" -> SecureSecretStore.KEY_OPENROUTER
+        "nvidia" -> SecureSecretStore.KEY_NVIDIA
+        "mistral" -> SecureSecretStore.KEY_MISTRAL
+        "openai" -> SecureSecretStore.KEY_OPENAI
+        "anthropic" -> SecureSecretStore.KEY_ANTHROPIC
+        "xai" -> SecureSecretStore.KEY_XAI
+        else -> ""
+    }
+
+    fun loadCachedProviderModels(): Job {
+        return runtimeScope.launch {
+            val cachedMap = configStore.loadAllProviderModelsCache()
+            if (cachedMap.isEmpty()) return@launch
+            val current = _providerModels.value.toMutableMap()
+            cachedMap.forEach { (providerId, cached) ->
+                val existing = current[providerId]
+                if (existing == null || (!existing.isLoading && existing.source == ModelListSource.NONE)) {
+                    current[providerId] = ProviderModelsUiState(
+                        providerId = providerId,
+                        models = cached.models,
+                        source = ModelListSource.CACHED,
+                        isLoading = false,
+                        error = null,
+                        lastFetchedAtMs = cached.fetchedAtMs
+                    )
+                }
+            }
+            _providerModels.value = current
+        }
+    }
+
+    fun refreshModelsForProvider(providerId: String): Job {
+        if (providerId !in BYO_LLM_PROVIDER_IDS) {
+            return runtimeScope.launch {}
+        }
+        pendingModelFetches[providerId]?.cancel()
+        val job = runtimeScope.launch {
+            val cachedFallback = configStore.loadProviderModelsCache(providerId)
+            val current = _providerModels.value[providerId]
+            val baseline = when {
+                current != null && current.models.isNotEmpty() -> current
+                cachedFallback != null -> ProviderModelsUiState(
+                    providerId = providerId,
+                    models = cachedFallback.models,
+                    source = ModelListSource.CACHED,
+                    lastFetchedAtMs = cachedFallback.fetchedAtMs
+                )
+                else -> ProviderModelsUiState(providerId = providerId)
+            }
+            _providerModels.value = _providerModels.value + (
+                providerId to baseline.copy(isLoading = true, error = null)
+                )
+
+            val secretKeyName = secretKeyForProvider(providerId)
+            val apiKey = if (secretKeyName.isNotBlank()) secretStore.getSecret(secretKeyName) else ""
+            if (apiKey.isBlank()) {
+                _providerModels.value = _providerModels.value + (
+                    providerId to baseline.copy(
+                        source = if (baseline.models.isNotEmpty()) baseline.source else ModelListSource.NONE,
+                        isLoading = false,
+                        error = "No API key saved for $providerId. Add one below to fetch models."
+                    )
+                    )
+                return@launch
+            }
+
+            val activeClient = byoAiClientOverride ?: byoAiClient
+            when (val res = activeClient.fetchModels(providerId, apiKey)) {
+                is FetchModelsResult.Success -> {
+                    val now = System.currentTimeMillis()
+                    configStore.saveProviderModelsCache(providerId, res.models, now)
+                    _providerModels.value = _providerModels.value + (
+                        providerId to ProviderModelsUiState(
+                            providerId = providerId,
+                            models = res.models,
+                            source = ModelListSource.LIVE,
+                            isLoading = false,
+                            error = if (res.models.isEmpty()) {
+                                "No compatible text chat models were returned by $providerId."
+                            } else {
+                                null
+                            },
+                            lastFetchedAtMs = now
+                        )
+                        )
+                }
+                is FetchModelsResult.Failure -> {
+                    val preservedSource = if (baseline.models.isNotEmpty()) {
+                        ModelListSource.CACHED
+                    } else {
+                        ModelListSource.NONE
+                    }
+                    _providerModels.value = _providerModels.value + (
+                        providerId to baseline.copy(
+                            source = preservedSource,
+                            isLoading = false,
+                            error = res.errorMessage
+                        )
+                        )
+                }
+            }
+        }
+        pendingModelFetches[providerId] = job
+        job.invokeOnCompletion {
+            pendingModelFetches.remove(providerId, job)
+        }
+        return job
+    }
+
+    fun selectProvider(providerId: String) {
+        updateBrain { cur ->
+            val nextModel = if (providerId in setOf("auto", "firebase_ai")) {
+                cur.providerModels[providerId]?.takeIf { it in FIREBASE_AI_MODELS }
+                    ?: "gemini-3.8-flash"
+            } else {
+                cur.providerModels[providerId].orEmpty()
+            }
+            cur.copy(activeProvider = providerId, activeModel = nextModel)
+        }
+    }
+
+    fun selectModel(providerId: String, modelId: String) {
+        val clean = modelId.trim()
+        if (clean.isEmpty()) return
+        updateBrain { cur ->
+            val updatedMap = cur.providerModels + (providerId to clean)
+            if (cur.activeProvider == providerId) {
+                cur.copy(activeModel = clean, providerModels = updatedMap)
+            } else {
+                cur.copy(providerModels = updatedMap)
+            }
+        }
+    }
+
+    fun refreshKeyStatuses(): Job {
+        return runtimeScope.launch {
             val configured = secretStore.allConfiguredKeys()
+            val currentMap = _keyStatuses.value
             val map = mutableMapOf<String, KeyCheckStatus>()
             configured.forEach { (key, has) ->
-                map[key] = if (has) KeyCheckStatus.WORKING else KeyCheckStatus.EMPTY
+                if (!has) {
+                    map[key] = KeyCheckStatus.EMPTY
+                } else {
+                    val inMemory = currentMap[key]
+                    val persisted = secretStore.getKeyStatus(key)
+                    map[key] = when {
+                        inMemory == KeyCheckStatus.CHECKING -> KeyCheckStatus.CHECKING
+                        persisted != null && persisted != KeyCheckStatus.EMPTY -> persisted
+                        inMemory != null && inMemory != KeyCheckStatus.EMPTY -> inMemory
+                        else -> KeyCheckStatus.NOT_VERIFIED
+                    }
+                }
             }
             _keyStatuses.value = map
         }
     }
 
-    fun saveAndVerifyApiKey(secretKeyName: String, providerId: String, rawValue: String) {
-        runtimeScope.launch {
-            secretStore.setSecret(secretKeyName, rawValue)
-            if (rawValue.isBlank()) {
+    fun saveAndVerifyApiKey(secretKeyName: String, providerId: String, rawValue: String): Job {
+        val trimmed = rawValue.trim()
+        pendingKeyVerifications[secretKeyName]?.cancel()
+        val job = runtimeScope.launch {
+            secretStore.setSecret(secretKeyName, trimmed)
+            if (trimmed.isEmpty()) {
+                secretStore.setKeyStatus(secretKeyName, KeyCheckStatus.EMPTY)
                 _keyStatuses.value = _keyStatuses.value + (secretKeyName to KeyCheckStatus.EMPTY)
                 return@launch
             }
             _keyStatuses.value = _keyStatuses.value + (secretKeyName to KeyCheckStatus.CHECKING)
-            val verdict = byoAiClient.verifyKey(providerId, rawValue)
+            val activeClient = byoAiClientOverride ?: byoAiClient
+            val verdict = activeClient.verifyKey(providerId, trimmed)
+            secretStore.setKeyStatus(secretKeyName, verdict)
             _keyStatuses.value = _keyStatuses.value + (secretKeyName to verdict)
+            if (providerId in BYO_LLM_PROVIDER_IDS &&
+                (verdict == KeyCheckStatus.WORKING || verdict == KeyCheckStatus.GENERATION_UNAVAILABLE)
+            ) {
+                refreshModelsForProvider(providerId)
+            }
         }
+        pendingKeyVerifications[secretKeyName] = job
+        job.invokeOnCompletion {
+            pendingKeyVerifications.remove(secretKeyName, job)
+        }
+        return job
     }
 
     fun setGrantedFolder(uri: Uri) {
@@ -1219,11 +1445,22 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         @Volatile
         private var INSTANCE: JarvisAssistantRuntime? = null
 
-        fun getInstance(context: Context): JarvisAssistantRuntime =
-            INSTANCE ?: synchronized(this) {
-                INSTANCE ?: JarvisAssistantRuntime(context.applicationContext).also {
-                    INSTANCE = it
+        fun getInstance(context: Context): JarvisAssistantRuntime {
+            val appCtx = context.applicationContext
+            val current = INSTANCE
+            if (current != null && current.context === appCtx) return current
+            return synchronized(this) {
+                val synced = INSTANCE
+                if (synced != null && synced.context === appCtx) {
+                    synced
+                } else {
+                    synced?.stopAssistant()
+                    synced?.runtimeScope?.cancel()
+                    JarvisAssistantRuntime(appCtx).also {
+                        INSTANCE = it
+                    }
                 }
             }
+        }
     }
 }

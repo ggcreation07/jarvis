@@ -6,6 +6,9 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.jarvis.app.data.ai.CachedProviderModels
+import com.jarvis.app.data.ai.DynamicModelInfo
+import com.jarvis.app.domain.model.BYO_LLM_PROVIDER_IDS
 import com.jarvis.app.domain.model.BrainConfig
 import com.jarvis.app.domain.model.ScreenConfig
 import kotlinx.coroutines.flow.Flow
@@ -27,6 +30,8 @@ class ConfigStore(private val context: Context) {
         private val KEY_BRAIN = stringPreferencesKey("brain_config_json")
         private val KEY_BOOKMARK_TEXT = stringPreferencesKey("reading_text")
         private val KEY_BOOKMARK_PAGE = stringPreferencesKey("reading_page")
+        private fun cachedModelsKey(providerId: String) =
+            stringPreferencesKey("cached_models_${providerId.lowercase()}")
     }
 
     val screenConfig: Flow<ScreenConfig> = context.jarvisDataStore.data.map { prefs ->
@@ -76,6 +81,40 @@ class ConfigStore(private val context: Context) {
             } ?: BrainConfig()
             prefs[KEY_BRAIN] = json.encodeToString(transform(current))
         }
+    }
+
+    suspend fun saveProviderModelsCache(
+        providerId: String,
+        models: List<DynamicModelInfo>,
+        fetchedAtMs: Long = System.currentTimeMillis()
+    ) {
+        val payload = CachedProviderModels(
+            providerId = providerId,
+            models = models,
+            fetchedAtMs = fetchedAtMs
+        )
+        context.jarvisDataStore.edit { prefs ->
+            prefs[cachedModelsKey(providerId)] = json.encodeToString(payload)
+        }
+    }
+
+    suspend fun loadProviderModelsCache(providerId: String): CachedProviderModels? {
+        val prefs = context.jarvisDataStore.data.first()
+        val raw = prefs[cachedModelsKey(providerId)] ?: return null
+        return runCatching { json.decodeFromString<CachedProviderModels>(raw) }.getOrNull()
+    }
+
+    suspend fun loadAllProviderModelsCache(): Map<String, CachedProviderModels> {
+        val prefs = context.jarvisDataStore.data.first()
+        val map = mutableMapOf<String, CachedProviderModels>()
+        for (providerId in BYO_LLM_PROVIDER_IDS) {
+            val raw = prefs[cachedModelsKey(providerId)] ?: continue
+            val parsed = runCatching { json.decodeFromString<CachedProviderModels>(raw) }.getOrNull()
+            if (parsed != null) {
+                map[providerId] = parsed
+            }
+        }
+        return map
     }
 
     suspend fun saveReadingSession(text: String, pageIndex: Int) {

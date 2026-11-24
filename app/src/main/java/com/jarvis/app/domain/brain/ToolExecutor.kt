@@ -408,8 +408,25 @@ class ToolExecutor(
             }
             "open_application" -> {
                 val name = strArg(args, "name")
-                val outcome = deviceController.openApplication(name)
+                val outcome = if (name.startsWith("uninstall ", ignoreCase = true) || name.startsWith("delete ", ignoreCase = true)) {
+                    val target = name.substringAfter(" ").trim()
+                    deviceController.requestUninstallApplication(target)
+                } else {
+                    deviceController.openApplication(name)
+                }
                 if (outcome.ok) ok("open_application", outcome.summary) else fail("open_application", outcome.summary)
+            }
+            "uninstall_app", "uninstall_application" -> {
+                val pkgOrName = strArg(args, "package").ifBlank { strArg(args, "name") }
+                val outcome = deviceController.requestUninstallApplication(pkgOrName)
+                if (outcome.ok) ok(normalizedName, outcome.summary) else fail(normalizedName, outcome.summary)
+            }
+            "send_message", "compose_message" -> {
+                val to = strArg(args, "to")
+                val body = strArg(args, "body").ifBlank { strArg(args, "message") }
+                val app = strArg(args, "app").ifBlank { "sms" }
+                val outcome = deviceController.composeMessage(to, body, app)
+                if (outcome.ok) ok(normalizedName, outcome.summary) else fail(normalizedName, outcome.summary)
             }
             "navigate_to" -> {
                 val dest = strArg(args, "destination")
@@ -453,6 +470,12 @@ class ToolExecutor(
                 val uri = configStore.getBrainConfigOnce().grantedFolderUri
                 val outcome = deviceController.readGrantedFileText(uri, path)
                 if (outcome.ok) ok("read_file", outcome.summary) else fail("read_file", outcome.summary)
+            }
+            "delete_file" -> {
+                val path = strArg(args, "path").ifBlank { strArg(args, "name") }
+                val uri = configStore.getBrainConfigOnce().grantedFolderUri
+                val outcome = deviceController.deleteGrantedFile(uri, path)
+                if (outcome.ok) ok("delete_file", outcome.summary) else fail("delete_file", outcome.summary)
             }
             "customize_screen" -> {
                 val action = strArg(args, "action")

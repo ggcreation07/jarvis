@@ -58,17 +58,36 @@ object ToolConfirmationPolicy {
         (args[key] as? JsonPrimitive)?.content?.trim().orEmpty()
 
     fun requiresConfirmation(toolName: String, args: Map<String, JsonElement>): Boolean {
-        return when (toolName.trim()) {
+        val normalized = toolName.trim()
+        return when (normalized) {
             "forget_fact" -> {
                 val query = strArg(args, "text").lowercase(Locale.ROOT)
-                query == "everything" || query == "all" || query == "*"
+                query == "everything" || query == "all" || query == "*" ||
+                    query.startsWith("all ") || query.startsWith("every ") ||
+                    query.contains("everything") || query.contains("all facts") ||
+                    query.contains("all memory") || query.contains("wipe memory")
             }
             "manage_schedule" -> {
-                strArg(args, "action").ifBlank { "get" }.equals("clear", ignoreCase = true)
+                val action = strArg(args, "action").ifBlank { "get" }.lowercase(Locale.ROOT)
+                action == "clear" || action == "delete" || action == "remove"
             }
             "control_interface" -> {
-                strArg(args, "action").equals("clear_chat", ignoreCase = true)
+                val action = strArg(args, "action").lowercase(Locale.ROOT)
+                action == "clear_chat" || action == "delete_chat"
             }
+            "customize_screen" -> {
+                strArg(args, "action").equals("reset", ignoreCase = true)
+            }
+            "device_control" -> {
+                strArg(args, "action").equals("dnd_on", ignoreCase = true)
+            }
+            "delete_file" -> true
+            "uninstall_app", "uninstall_application" -> true
+            "open_application" -> {
+                val name = strArg(args, "name").lowercase(Locale.ROOT)
+                name.startsWith("uninstall ") || name.startsWith("delete ")
+            }
+            "send_message", "compose_message" -> true
             "pc_task" -> {
                 val goal = strArg(args, "goal")
                 val kind = strArg(args, "kind").ifBlank { "browser" }
@@ -96,6 +115,25 @@ object ToolConfirmationPolicy {
             "control_interface" -> mapOf(
                 "action" to strArg(args, "action").lowercase(Locale.ROOT)
             )
+            "customize_screen" -> mapOf(
+                "action" to strArg(args, "action").lowercase(Locale.ROOT)
+            )
+            "device_control" -> mapOf(
+                "action" to strArg(args, "action").lowercase(Locale.ROOT)
+            )
+            "delete_file" -> mapOf(
+                "path" to strArg(args, "path").ifBlank { strArg(args, "name") }.lowercase(Locale.ROOT)
+            )
+            "uninstall_app", "uninstall_application" -> mapOf(
+                "package" to strArg(args, "package").ifBlank { strArg(args, "name") }.lowercase(Locale.ROOT)
+            )
+            "open_application" -> mapOf(
+                "name" to strArg(args, "name").lowercase(Locale.ROOT)
+            )
+            "send_message", "compose_message" -> mapOf(
+                "to" to strArg(args, "to").lowercase(Locale.ROOT),
+                "body" to strArg(args, "body").ifBlank { strArg(args, "message") }.replace(Regex("\\s+"), " ").lowercase(Locale.ROOT)
+            )
             "pc_task" -> mapOf(
                 "goal" to strArg(args, "goal").replace(Regex("\\s+"), " ").lowercase(Locale.ROOT),
                 "kind" to strArg(args, "kind").ifBlank { "browser" }.lowercase(Locale.ROOT)
@@ -109,16 +147,35 @@ object ToolConfirmationPolicy {
     }
 
     fun describeProtectedAction(toolName: String, args: Map<String, JsonElement>): String {
-        return when (toolName.trim()) {
+        val normalizedTool = toolName.trim()
+        return when (normalizedTool) {
             "forget_fact" -> "delete all remembered facts from long-term memory"
             "manage_schedule" -> "clear all local items from today's schedule"
             "control_interface" -> "clear the current conversation history"
+            "customize_screen" -> "reset HUD appearance and theme customization to defaults"
+            "device_control" -> "enable Do Not Disturb mode and silence notifications"
+            "delete_file" -> {
+                val path = strArg(args, "path").ifBlank { strArg(args, "name") }.ifBlank { "the selected file" }
+                "permanently delete the file \"$path\" from your granted folder"
+            }
+            "uninstall_app", "uninstall_application" -> {
+                val target = strArg(args, "package").ifBlank { strArg(args, "name") }.ifBlank { "the application" }
+                "prompt uninstallation of the application \"$target\""
+            }
+            "open_application" -> {
+                val name = strArg(args, "name")
+                "prompt uninstallation for \"$name\""
+            }
+            "send_message", "compose_message" -> {
+                val to = strArg(args, "to").ifBlank { "recipient" }
+                "prepare and send a message to $to"
+            }
             "pc_task" -> {
                 val goal = strArg(args, "goal").ifBlank { "remote command" }.take(100)
                 val kind = strArg(args, "kind").ifBlank { "browser" }
                 "run the high-impact PC task \"$goal\" ($kind mode) on your paired Windows PC"
             }
-            else -> "execute $toolName"
+            else -> "execute $normalizedTool"
         }
     }
 
@@ -222,8 +279,9 @@ object ConfirmationClassifier {
         "clear", "delete", "forget", "remove", "reset", "shutdown", "chat", "schedule", "agenda",
         "memory", "facts", "pc", "sab", "sub", "sagle", "kar", "do", "kara", "karo", "de", "dijiye",
         "theek", "thik", "hai", "ahe", "ahead", "go",
+        "dnd", "disturb", "file", "uninstall", "message", "send", "app", "mode", "theme", "hud", "setting", "settings",
         "अरे", "कृपया", "जी", "ठीक", "है", "आहे", "सगळं", "सब", "कर", "दो", "करा", "करो", "दीजिए",
-        "हटा", "हटाओ", "मिटाओ", "डिलीट", "चैट", "शेड्यूल", "मेमोरी"
+        "हटा", "हटाओ", "मिटाओ", "डिलीट", "चैट", "शेड्यूल", "मेमोरी", "फाइल", "मैसेज", "संदेश", "अॅप", "अनइंस्टॉल"
     )
 
     fun classify(rawInput: String): ConfirmationIntent {

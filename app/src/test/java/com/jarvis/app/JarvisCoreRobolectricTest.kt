@@ -5,7 +5,16 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.OnBackPressedDispatcherOwner
+import androidx.activity.findViewTreeOnBackPressedDispatcherOwner
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+import androidx.activity.compose.setContent
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.jarvis.app.data.local.JarvisDatabase
@@ -673,6 +682,89 @@ class JarvisCoreRobolectricTest {
             runtime.stopAssistant()
             session.onDestroy()
             serviceController.destroy()
+        }
+    }
+
+    @Test
+    fun `voice interaction session provides OnBackPressedDispatcherOwner and safe BackHandler handling`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        Shadows.shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)
+        runtime.stopAssistant()
+
+        val serviceController = Robolectric.buildService(
+            com.jarvis.app.platform.JarvisVoiceInteractionSessionService::class.java
+        )
+        val sessionService = serviceController.create().get()
+        val session = sessionService.onNewSession(null) as com.jarvis.app.platform.JarvisVoiceInteractionSession
+        try {
+            session.onCreate()
+            val contentView = session.onCreateContentView()
+            assertNotNull(contentView)
+            session.onPrepareShow(null, 0)
+            session.onShow(null, 0)
+
+            // Verify session implements OnBackPressedDispatcherOwner and tree owner is attached
+            assertTrue("Session must implement OnBackPressedDispatcherOwner", session is OnBackPressedDispatcherOwner)
+            val treeOwner = contentView.findViewTreeOnBackPressedDispatcherOwner()
+            assertEquals("ComposeView must have session as ViewTreeOnBackPressedDispatcherOwner", session, treeOwner)
+            assertNotNull("Session must provide non-null OnBackPressedDispatcher", session.onBackPressedDispatcher)
+
+            // Verify a custom back callback or BackHandler on dispatcher is invoked
+            var backCallbackInvoked = false
+            val callback = object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    backCallbackInvoked = true
+                }
+            }
+            session.onBackPressedDispatcher.addCallback(callback)
+            assertTrue("Dispatcher must have enabled callback", session.onBackPressedDispatcher.hasEnabledCallbacks())
+
+            session.onBackPressed()
+            assertTrue("onBackPressed must route to dispatcher and invoke active callback", backCallbackInvoked)
+
+            // When callback is removed, session fallback hides voice-only UI while keeping session alive
+            callback.remove()
+            assertFalse("Dispatcher should have no enabled callbacks after removal", session.onBackPressedDispatcher.hasEnabledCallbacks())
+
+            runtime.activateVoiceOnlyUi(AssistantLaunchIntentHelper.ACTION_VOICE_INTERACTION_SESSION, nowMs = 60_000L)
+            assertTrue(runtime.isVoiceOnlyUiActive.value)
+            assertTrue(runtime.isVoiceSessionActive.value)
+
+            session.onBackPressed()
+            assertFalse("Fallback back handling must hide voice-only UI", runtime.isVoiceOnlyUiActive.value)
+            assertTrue("Fallback back handling must preserve active voice session", runtime.isVoiceSessionActive.value)
+        } finally {
+            runtime.stopAssistant()
+            session.onDestroy()
+            serviceController.destroy()
+        }
+    }
+
+    @Test
+    fun `voice only assistant screen registers BackHandler and invokes onHideKeepSession on back press`() {
+        val activityController = Robolectric.buildActivity(ComponentActivity::class.java).setup()
+        val activity = activityController.get()
+        try {
+            var hideCalled = false
+            activity.setContent {
+                com.jarvis.app.ui.screens.VoiceOnlyAssistantScreen(
+                    orbState = com.jarvis.app.ui.components.OrbState.IDLE,
+                    audioLevel = 0f,
+                    speakingLevel = 0f,
+                    launchEvent = null,
+                    translucentOverlay = true,
+                    onEntranceCompleted = {},
+                    onOrbClick = {},
+                    onHideKeepSession = { hideCalled = true },
+                    onStopAssistant = {}
+                )
+            }
+            assertTrue("BackHandler must register enabled callback on OnBackPressedDispatcherOwner", activity.onBackPressedDispatcher.hasEnabledCallbacks())
+            activity.onBackPressedDispatcher.onBackPressed()
+            assertTrue("Back press must invoke onHideKeepSession", hideCalled)
+        } finally {
+            activityController.pause().stop().destroy()
         }
     }
 

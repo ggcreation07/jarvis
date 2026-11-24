@@ -1,6 +1,7 @@
 package com.jarvis.app.ui.screens
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
@@ -81,7 +82,9 @@ fun VoiceOnlyAssistantScreen(
         }
     }
 
-    BackHandler(onBack = onHideKeepSession)
+    if (LocalOnBackPressedDispatcherOwner.current != null) {
+        BackHandler(onBack = onHideKeepSession)
+    }
 
     val p = entranceProgress.value
     val orbScale = if (p < 1f) {

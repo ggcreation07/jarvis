@@ -8,6 +8,11 @@ import android.service.voice.VoiceInteractionSession
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import androidx.activity.OnBackPressedDispatcher
+import androidx.activity.OnBackPressedDispatcherOwner
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+import androidx.activity.setViewTreeOnBackPressedDispatcherOwner
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.ComposeView
@@ -29,10 +34,14 @@ import com.jarvis.app.ui.theme.JarvisTheme
 
 class JarvisVoiceInteractionSession(
     context: Context
-) : VoiceInteractionSession(context), LifecycleOwner, SavedStateRegistryOwner {
+) : VoiceInteractionSession(context),
+    LifecycleOwner,
+    SavedStateRegistryOwner,
+    OnBackPressedDispatcherOwner {
 
     private val lifecycleRegistry = LifecycleRegistry(this)
     private val savedStateRegistryController = SavedStateRegistryController.create(this)
+    private var contentComposeView: ComposeView? = null
     private val runtime: JarvisAssistantRuntime by lazy {
         JarvisAssistantRuntime.getInstance(context.applicationContext)
     }
@@ -42,6 +51,10 @@ class JarvisVoiceInteractionSession(
 
     override val savedStateRegistry: SavedStateRegistry
         get() = savedStateRegistryController.savedStateRegistry
+
+    override val onBackPressedDispatcher: OnBackPressedDispatcher = OnBackPressedDispatcher {
+        hideKeepSessionFromBack()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -55,6 +68,7 @@ class JarvisVoiceInteractionSession(
         return ComposeView(context).apply {
             setViewTreeLifecycleOwner(this@JarvisVoiceInteractionSession)
             setViewTreeSavedStateRegistryOwner(this@JarvisVoiceInteractionSession)
+            setViewTreeOnBackPressedDispatcherOwner(this@JarvisVoiceInteractionSession)
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
             setContent {
                 val screenConfig by runtime.screenConfig.collectAsStateWithLifecycle()
@@ -76,33 +90,37 @@ class JarvisVoiceInteractionSession(
                 }
 
                 JarvisTheme(screenConfig = screenConfig) {
-                    VoiceOnlyAssistantScreen(
-                        orbState = orbState,
-                        audioLevel = audioLevel,
-                        speakingLevel = speakingLevel,
-                        launchEvent = launchEvent,
-                        translucentOverlay = true,
-                        onEntranceCompleted = { id -> runtime.markAssistantEntranceCompleted(id) },
-                        onOrbClick = {
-                            if (hudStatus == HudStatus.LISTENING || hudStatus == HudStatus.SPEAKING || isBusy) {
-                                runtime.stopCurrentWork()
-                            } else if (!runtime.hasRecordAudioPermission()) {
-                                launchPermissionHostActivity()
-                            } else {
-                                runtime.startAssistantListeningIfIdle(startForegroundServiceIfPermitted = true)
+                    CompositionLocalProvider(
+                        LocalOnBackPressedDispatcherOwner provides this@JarvisVoiceInteractionSession
+                    ) {
+                        VoiceOnlyAssistantScreen(
+                            orbState = orbState,
+                            audioLevel = audioLevel,
+                            speakingLevel = speakingLevel,
+                            launchEvent = launchEvent,
+                            translucentOverlay = true,
+                            onEntranceCompleted = { id -> runtime.markAssistantEntranceCompleted(id) },
+                            onOrbClick = {
+                                if (hudStatus == HudStatus.LISTENING || hudStatus == HudStatus.SPEAKING || isBusy) {
+                                    runtime.stopCurrentWork()
+                                } else if (!runtime.hasRecordAudioPermission()) {
+                                    launchPermissionHostActivity()
+                                } else {
+                                    runtime.startAssistantListeningIfIdle(startForegroundServiceIfPermitted = true)
+                                }
+                            },
+                            onHideKeepSession = {
+                                runtime.hideVoiceOnlyUiKeepSession()
+                                hide()
+                            },
+                            onStopAssistant = {
+                                runtime.stopAssistant()
                             }
-                        },
-                        onHideKeepSession = {
-                            runtime.hideVoiceOnlyUiKeepSession()
-                            hide()
-                        },
-                        onStopAssistant = {
-                            runtime.stopAssistant()
-                        }
-                    )
+                        )
+                    }
                 }
             }
-        }
+        }.also { contentComposeView = it }
     }
 
     override fun onPrepareShow(args: Bundle?, showFlags: Int) {
@@ -157,9 +175,9 @@ class JarvisVoiceInteractionSession(
     }
 
     override fun onBackPressed() {
-        // Hide the voice overlay without cancelling background voice listening/TTS/session.
-        runtime.hideVoiceOnlyUiKeepSession()
-        runCatching { hide() }
+        // Route system Back through OnBackPressedDispatcher so BackHandler runs when active,
+        // falling back to hiding the overlay without cancelling background voice listening/TTS/session.
+        onBackPressedDispatcher.onBackPressed()
     }
 
     override fun onDestroy() {
@@ -172,7 +190,14 @@ class JarvisVoiceInteractionSession(
         ) {
             lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         }
+        runCatching { contentComposeView?.disposeComposition() }
+        contentComposeView = null
         super.onDestroy()
+    }
+
+    private fun hideKeepSessionFromBack() {
+        runtime.hideVoiceOnlyUiKeepSession()
+        runCatching { hide() }
     }
 
     private fun launchPermissionHostActivity() {
@@ -190,6 +215,7 @@ class JarvisVoiceInteractionSession(
             val decor = window?.window?.decorView ?: return
             decor.setViewTreeLifecycleOwner(this)
             decor.setViewTreeSavedStateRegistryOwner(this)
+            decor.setViewTreeOnBackPressedDispatcherOwner(this)
         }
     }
 

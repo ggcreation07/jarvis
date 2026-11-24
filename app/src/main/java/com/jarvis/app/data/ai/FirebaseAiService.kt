@@ -191,6 +191,26 @@ open class FirebaseAiService {
                 mapOf("path" to Schema.string("Filename to read"))
             ),
             FunctionDeclaration(
+                "delete_file",
+                "Permanently delete a file from the user's granted Storage Access Framework folder.",
+                mapOf("path" to Schema.string("Filename to delete"))
+            ),
+            FunctionDeclaration(
+                "uninstall_app",
+                "Prompt uninstallation of an installed Android application.",
+                mapOf("package" to Schema.string("App name or package to uninstall"))
+            ),
+            FunctionDeclaration(
+                "send_message",
+                "Compose and send an SMS or WhatsApp message to a recipient.",
+                mapOf(
+                    "to" to Schema.string("Recipient phone number or name"),
+                    "body" to Schema.string("Message text to send"),
+                    "app" to Schema.enumeration(listOf("sms", "whatsapp"), "Target messaging app")
+                ),
+                optionalParameters = listOf("app")
+            ),
+            FunctionDeclaration(
                 "customize_screen",
                 "Change JARVIS HUD look, preset (modern/ironman), or color accent.",
                 mapOf(
@@ -249,7 +269,9 @@ open class FirebaseAiService {
     ): Flow<AiStreamEvent> = flow {
         val selectedModel = when (modelName) {
             "gemini-3.5-flash-lite", "gemini-4-argon", "gemini-3.8-flash" -> modelName
-            else -> "gemini-3.8-flash"
+            else -> throw IllegalArgumentException(
+                "Model '$modelName' is not supported by built-in Firebase AI Logic. Select a Firebase AI model in Settings."
+            )
         }
         val declarations = buildToolDeclarations(pcPaired, tvPaired)
         val model = Firebase.ai.generativeModel(
@@ -359,6 +381,9 @@ open class FirebaseAiService {
         "read_notifications" -> "Reading notifications"
         "read_clipboard" -> "Reading clipboard"
         "list_directory", "read_file" -> "Accessing files"
+        "delete_file" -> "Deleting file"
+        "uninstall_app", "uninstall_application" -> "Uninstalling app"
+        "send_message", "compose_message" -> "Preparing message"
         "customize_screen" -> "Updating HUD look"
         "control_interface" -> "Opening panel"
         "pc_task", "wake_pc" -> "Contacting paired PC"

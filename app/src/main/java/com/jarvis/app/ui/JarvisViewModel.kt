@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import com.jarvis.app.data.ai.KeyCheckStatus
+import com.jarvis.app.data.ai.ProviderModelsUiState
 import com.jarvis.app.data.ai.QuotaUsageSnapshot
 import com.jarvis.app.data.security.DeviceIdentityManager
 import com.jarvis.app.data.security.SecureSecretStore
@@ -76,6 +77,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     val lastDetectedPose: StateFlow<HandPose> get() = runtime.lastDetectedPose
 
     val keyStatuses: StateFlow<Map<String, KeyCheckStatus>> get() = runtime.keyStatuses
+    val providerModels: StateFlow<Map<String, ProviderModelsUiState>> get() = runtime.providerModels
     val quotaSnapshots: StateFlow<List<QuotaUsageSnapshot>> get() = runtime.quotaSnapshots
     val accessibilityEnabled: StateFlow<Boolean> get() = runtime.accessibilityEnabled
     val notificationAccessEnabled: StateFlow<Boolean> get() = runtime.notificationAccessEnabled
@@ -190,6 +192,12 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleMute() = runtime.toggleMute()
 
     fun refreshKeyStatuses() = runtime.refreshKeyStatuses()
+
+    fun refreshModelsForProvider(providerId: String) = runtime.refreshModelsForProvider(providerId)
+
+    fun selectProvider(providerId: String) = runtime.selectProvider(providerId)
+
+    fun selectModel(providerId: String, modelId: String) = runtime.selectModel(providerId, modelId)
 
     fun saveAndVerifyApiKey(secretKeyName: String, providerId: String, rawValue: String) =
         runtime.saveAndVerifyApiKey(secretKeyName, providerId, rawValue)

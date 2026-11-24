@@ -15,7 +15,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
-import com.jarvis.app.MainActivity
+import com.jarvis.app.AssistantOverlayActivity
 import com.jarvis.app.R
 import com.jarvis.app.domain.model.HudStatus
 import kotlinx.coroutines.CoroutineScope
@@ -109,7 +109,7 @@ class VoiceAssistantForegroundService : Service() {
             HudStatus.IDLE -> getString(R.string.voice_notif_ready)
         }
 
-        val openOrbIntent = Intent(this, MainActivity::class.java).apply {
+        val openOrbIntent = Intent(this, AssistantOverlayActivity::class.java).apply {
             action = Intent.ACTION_ASSIST
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         }
@@ -131,7 +131,7 @@ class VoiceAssistantForegroundService : Service() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_jarvis)
             .setContentTitle(getString(R.string.voice_notif_title))
             .setContentText(statusText)
             .setOngoing(true)

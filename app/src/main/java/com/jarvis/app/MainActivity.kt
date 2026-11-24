@@ -46,15 +46,12 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.jarvis.app.domain.model.HudStatus
 import com.jarvis.app.domain.model.OverlayType
-import com.jarvis.app.platform.AssistantLaunchIntentHelper
 import com.jarvis.app.platform.RoutineAlarms
 import com.jarvis.app.ui.JarvisViewModel
 import com.jarvis.app.ui.components.AssistantLaunchEntranceOverlay
 import com.jarvis.app.ui.components.resolveOrbState
 import com.jarvis.app.ui.screens.AssistantMainScreen
-import com.jarvis.app.ui.screens.VoiceOnlyAssistantScreen
 import com.jarvis.app.ui.sheets.CapabilitiesSheet
 import com.jarvis.app.ui.sheets.CommandPaletteDialog
 import com.jarvis.app.ui.sheets.CustomizeSheet
@@ -74,26 +71,6 @@ import com.jarvis.app.ui.theme.LocalJarvisColors
 class MainActivity : ComponentActivity() {
 
     private val viewModel: JarvisViewModel by viewModels()
-
-    private val assistantMicPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        onAssistantMicPermissionResult(granted)
-    }
-
-    internal fun onAssistantMicPermissionResult(granted: Boolean) {
-        if (granted) {
-            viewModel.startAssistantListeningIfIdle()
-        } else {
-            viewModel.showBanner("Microphone permission denied. Tap the orb to enable voice.")
-        }
-    }
-
-    internal fun onVoiceOnlyBackPressed() {
-        // Hide UI while keeping active voice session & foreground service running in background.
-        viewModel.hideVoiceOnlyUiKeepSession()
-        runCatching { moveTaskToBack(true) }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -173,40 +150,10 @@ class MainActivity : ComponentActivity() {
             JarvisTheme(screenConfig = screenConfig) {
                 val hud = LocalJarvisColors.current
                 Box(modifier = Modifier.fillMaxSize()) {
-                    if (isVoiceOnlyUiActive) {
-                        VoiceOnlyAssistantScreen(
-                            orbState = currentOrbState,
-                            audioLevel = audioLevel,
-                            speakingLevel = speakingLevel,
-                            launchEvent = assistantLaunchEvent,
-                            translucentOverlay = false,
-                            onEntranceCompleted = { id -> viewModel.markAssistantEntranceCompleted(id) },
-                            onOrbClick = {
-                                if (hudStatus == HudStatus.LISTENING || hudStatus == HudStatus.SPEAKING || isBusy) {
-                                    viewModel.stopCurrentWork()
-                                } else {
-                                    val hasMic = ContextCompat.checkSelfPermission(
-                                        this@MainActivity,
-                                        Manifest.permission.RECORD_AUDIO
-                                    ) == PackageManager.PERMISSION_GRANTED
-                                    if (hasMic) {
-                                        viewModel.startAssistantListeningIfIdle()
-                                    } else {
-                                        assistantMicPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                    }
-                                }
-                            },
-                            onHideKeepSession = { onVoiceOnlyBackPressed() },
-                            onStopAssistant = {
-                                viewModel.stopAssistantSession()
-                                runCatching { moveTaskToBack(true) }
-                            }
-                        )
-                    } else {
-                        AssistantMainScreen(
-                            viewModel = viewModel,
-                            onRequestMicAndToggleVoice = requestMicAndToggleVoice
-                        )
+                    AssistantMainScreen(
+                        viewModel = viewModel,
+                        onRequestMicAndToggleVoice = requestMicAndToggleVoice
+                    )
 
                         if (isVoiceSessionActive) {
                             Row(
@@ -314,7 +261,6 @@ class MainActivity : ComponentActivity() {
                                     onEntranceCompleted = { id -> viewModel.markAssistantEntranceCompleted(id) }
                                 )
                             }
-                    }
 
                     SnackbarHost(
                         hostState = snackbarHostState,
@@ -349,26 +295,6 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIncomingIntent(intent: Intent?, fromSavedState: Boolean) {
         if (intent == null) return
-        if (AssistantLaunchIntentHelper.shouldHandleAssistantIntent(intent, fromSavedState)) {
-            val action = intent.action ?: return
-            AssistantLaunchIntentHelper.markHandled(intent)
-            if (viewModel.activateVoiceOnlyUi(action)) {
-                val launchEvent = viewModel.assistantLaunchEvent.value
-                if (launchEvent != null && !launchEvent.voiceTriggered) {
-                    viewModel.markAssistantVoiceTriggered(launchEvent.launchId)
-                    val hasMic = ContextCompat.checkSelfPermission(
-                        this,
-                        Manifest.permission.RECORD_AUDIO
-                    ) == PackageManager.PERMISSION_GRANTED
-                    if (hasMic) {
-                        viewModel.startAssistantListeningIfIdle()
-                    } else {
-                        assistantMicPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                    }
-                }
-            }
-            return
-        }
         if (!fromSavedState && intent.action == Intent.ACTION_MAIN) {
             viewModel.exitVoiceOnlyUiForNormalHome()
         }

@@ -438,7 +438,7 @@ class JarvisCoreRobolectricTest {
     }
 
     @Test
-    fun `manifest resolves ACTION_ASSIST and ACTION_VOICE_COMMAND to MainActivity while preserving ACTION_SEND`() {
+    fun `manifest resolves ACTION_ASSIST and ACTION_VOICE_COMMAND to AssistantOverlayActivity while preserving ACTION_SEND on MainActivity`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val pm = context.packageManager
 
@@ -447,7 +447,11 @@ class JarvisCoreRobolectricTest {
             PackageManager.MATCH_DEFAULT_ONLY
         )
         assertTrue(
-            "MainActivity must resolve ACTION_ASSIST",
+            "AssistantOverlayActivity must resolve ACTION_ASSIST",
+            assistMatches.any { it.activityInfo.name == AssistantOverlayActivity::class.java.name }
+        )
+        assertFalse(
+            "MainActivity should no longer intercept ACTION_ASSIST",
             assistMatches.any { it.activityInfo.name == MainActivity::class.java.name }
         )
 
@@ -456,7 +460,11 @@ class JarvisCoreRobolectricTest {
             PackageManager.MATCH_DEFAULT_ONLY
         )
         assertTrue(
-            "MainActivity must resolve ACTION_VOICE_COMMAND",
+            "AssistantOverlayActivity must resolve ACTION_VOICE_COMMAND",
+            voiceCmdMatches.any { it.activityInfo.name == AssistantOverlayActivity::class.java.name }
+        )
+        assertFalse(
+            "MainActivity should no longer intercept ACTION_VOICE_COMMAND",
             voiceCmdMatches.any { it.activityInfo.name == MainActivity::class.java.name }
         )
 
@@ -482,7 +490,6 @@ class JarvisCoreRobolectricTest {
         assertFalse(AssistantLaunchIntentHelper.shouldHandleAssistantIntent(assistIntent, savedInstanceStatePresent = false))
 
         assertTrue(AssistantLaunchIntentHelper.shouldHandleAssistantIntent(Intent(Intent.ACTION_VOICE_COMMAND), false))
-        assertTrue(AssistantLaunchIntentHelper.shouldHandleAssistantIntent(Intent(AssistantLaunchIntentHelper.ACTION_VOICE_INTERACTION_SESSION), false))
         assertFalse(AssistantLaunchIntentHelper.shouldHandleAssistantIntent(Intent(Intent.ACTION_MAIN), false))
         assertFalse(AssistantLaunchIntentHelper.shouldHandleAssistantIntent(Intent(Intent.ACTION_SEND), false))
 
@@ -521,14 +528,14 @@ class JarvisCoreRobolectricTest {
     }
 
     @Test
-    fun `main activity handles cold start warm start config recreation voice-only back behavior and mic permissions`() {
+    fun `assistant overlay activity handles cold start warm start config recreation back behavior and mic permissions`() {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)
         runtime.stopAssistant()
 
-        // Case 1: Microphone permission DENIED -> cold start with ACTION_ASSIST opens voice-only mode safely without crashing
+        // Case 1: Microphone permission DENIED -> cold start with ACTION_ASSIST opens overlay safely without crashing
         Shadows.shadowOf(app).denyPermissions(Manifest.permission.RECORD_AUDIO)
-        val deniedController = Robolectric.buildActivity(MainActivity::class.java, Intent(Intent.ACTION_ASSIST))
+        val deniedController = Robolectric.buildActivity(AssistantOverlayActivity::class.java, Intent(Intent.ACTION_ASSIST))
         deniedController.create().start().resume()
         ShadowLooper.runUiThreadTasks()
         val deniedActivity = deniedController.get()
@@ -538,7 +545,8 @@ class JarvisCoreRobolectricTest {
         assertTrue(deniedVm.isVoiceOnlyUiActive.value)
         assertTrue(deniedVm.isVoiceSessionActive.value)
         assertFalse(deniedVm.voiceController.isListening.value)
-        // Explicit permission denial callback leaves voice-only UI safe with banner feedback
+        assertFalse(deniedActivity.isFinishing)
+        // Explicit permission denial callback leaves overlay safe with banner feedback
         deniedActivity.onAssistantMicPermissionResult(false)
         assertTrue(deniedVm.bannerMessage.value?.contains("denied", ignoreCase = true) == true)
         deniedController.pause().stop().destroy()
@@ -546,7 +554,7 @@ class JarvisCoreRobolectricTest {
 
         // Case 2: Microphone permission GRANTED -> cold start, config-change no-replay, warm-start, Back hide, Stop Assistant, ACTION_MAIN
         Shadows.shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
-        val grantedController = Robolectric.buildActivity(MainActivity::class.java, Intent(Intent.ACTION_ASSIST))
+        val grantedController = Robolectric.buildActivity(AssistantOverlayActivity::class.java, Intent(Intent.ACTION_ASSIST))
         grantedController.create().start().resume()
         ShadowLooper.runUiThreadTasks()
         val grantedActivity = grantedController.get()
@@ -559,20 +567,20 @@ class JarvisCoreRobolectricTest {
         assertTrue(grantedVm.isVoiceSessionActive.value)
         grantedActivity.onAssistantMicPermissionResult(true)
 
-        // Pressing Back hides voice-only UI without terminating active voice session
+        // Pressing Back hides voice-only UI and finishes overlay without terminating active voice session
         grantedActivity.onVoiceOnlyBackPressed()
         assertFalse(grantedVm.isVoiceOnlyUiActive.value)
         assertTrue(grantedVm.isVoiceSessionActive.value)
+        assertTrue(grantedActivity.isFinishing)
 
         // Activity onStop preserves active voice session
         grantedController.pause().stop()
         assertTrue(grantedVm.isVoiceSessionActive.value)
-        grantedController.start().resume()
 
         // Configuration change recreation (savedInstanceState != null) must NOT re-fire assistant launch
         val launchCountBeforeRotate = grantedVm.assistantLaunchEvent.value?.launchId
         val rotatedController = Robolectric.buildActivity(
-            MainActivity::class.java,
+            AssistantOverlayActivity::class.java,
             Intent(Intent.ACTION_ASSIST)
         )
         rotatedController.create(android.os.Bundle().apply { putBoolean("rotated", true) }).start().resume()
@@ -582,38 +590,49 @@ class JarvisCoreRobolectricTest {
         rotatedController.pause().stop().destroy()
 
         // Warm start via onNewIntent after debounce window re-enters voice-only orb UI
-        Thread.sleep(400L)
-        grantedController.newIntent(Intent(Intent.ACTION_VOICE_COMMAND))
+        val warmController = Robolectric.buildActivity(AssistantOverlayActivity::class.java, Intent(Intent.ACTION_ASSIST))
+        warmController.create().start().resume()
         ShadowLooper.runUiThreadTasks()
-        val warmEvent = grantedVm.assistantLaunchEvent.value
+        val warmActivity = warmController.get()
+        val warmVm = ViewModelProvider(warmActivity)[JarvisViewModel::class.java]
+        val warmStartId = warmVm.assistantLaunchEvent.value?.launchId ?: 0L
+
+        Thread.sleep(400L)
+        warmController.newIntent(Intent(Intent.ACTION_VOICE_COMMAND))
+        ShadowLooper.runUiThreadTasks()
+        val warmEvent = warmVm.assistantLaunchEvent.value
         assertNotNull(warmEvent)
         assertEquals(Intent.ACTION_VOICE_COMMAND, warmEvent?.action)
-        assertTrue((warmEvent?.launchId ?: 0L) > initialEvent!!.launchId)
+        assertTrue((warmEvent?.launchId ?: 0L) > warmStartId)
         assertTrue(warmEvent?.voiceTriggered == true)
-        assertTrue(grantedVm.isVoiceOnlyUiActive.value)
+        assertTrue(warmVm.isVoiceOnlyUiActive.value)
 
-        // Normal launcher ACTION_MAIN shows regular AssistantMainScreen (exits voice-only UI)
-        grantedController.newIntent(Intent(Intent.ACTION_MAIN))
+        // Normal launcher ACTION_MAIN in MainActivity keeps regular AssistantMainScreen (exits voice-only UI)
+        val mainController = Robolectric.buildActivity(MainActivity::class.java, Intent(Intent.ACTION_MAIN))
+        mainController.create().start().resume()
         ShadowLooper.runUiThreadTasks()
-        assertFalse(grantedVm.isVoiceOnlyUiActive.value)
-        assertTrue(grantedVm.isVoiceSessionActive.value)
+        assertFalse(warmVm.isVoiceOnlyUiActive.value)
+        assertTrue(warmVm.isVoiceSessionActive.value)
+        mainController.pause().stop().destroy()
 
-        // Stop Assistant action terminates background voice session cleanly
-        grantedVm.stopAssistantSession()
-        assertFalse(grantedVm.isVoiceSessionActive.value)
-        assertFalse(grantedVm.isVoiceOnlyUiActive.value)
+        // Stop Assistant action terminates background voice session cleanly and finishes overlay
+        warmActivity.onStopAssistantClicked()
+        assertFalse(warmVm.isVoiceSessionActive.value)
+        assertFalse(warmVm.isVoiceOnlyUiActive.value)
+        assertTrue(warmActivity.isFinishing)
 
-        grantedController.pause().stop().destroy()
+        warmController.pause().stop().destroy()
+        grantedController.destroy()
     }
 
     @Test
-    fun `manifest declares VoiceInteractionService VoiceInteractionSessionService and microphone foreground service`() {
+    fun `manifest removes VoiceInteraction services and declares AssistantOverlayActivity and microphone foreground service`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val pm = context.packageManager
 
         val pkgInfo = pm.getPackageInfo(
             context.packageName,
-            PackageManager.GET_PERMISSIONS or PackageManager.GET_SERVICES or PackageManager.GET_META_DATA
+            PackageManager.GET_PERMISSIONS or PackageManager.GET_SERVICES or PackageManager.GET_ACTIVITIES or PackageManager.GET_META_DATA
         )
         val perms = pkgInfo.requestedPermissions?.toSet().orEmpty()
         assertTrue(perms.contains(Manifest.permission.FOREGROUND_SERVICE))
@@ -624,21 +643,20 @@ class JarvisCoreRobolectricTest {
             Intent("android.service.voice.VoiceInteractionService").setPackage(context.packageName),
             PackageManager.GET_META_DATA
         )
-        val visService = visMatches.firstOrNull {
-            it.serviceInfo.name == com.jarvis.app.platform.JarvisVoiceInteractionService::class.java.name
-        }?.serviceInfo
-        assertNotNull("JarvisVoiceInteractionService must resolve VoiceInteractionService intent", visService)
-        assertEquals(Manifest.permission.BIND_VOICE_INTERACTION, visService?.permission)
-        assertEquals(
-            R.xml.jarvis_voice_interaction,
-            visService?.metaData?.getInt("android.voice_interaction")
-        )
+        assertTrue("No VoiceInteractionService should remain declared", visMatches.isEmpty())
 
-        val sessionServiceInfo = pkgInfo.services?.firstOrNull {
-            it.name == com.jarvis.app.platform.JarvisVoiceInteractionSessionService::class.java.name
+        val recogMatches = pm.queryIntentServices(
+            Intent("android.speech.RecognitionService").setPackage(context.packageName),
+            PackageManager.GET_META_DATA
+        )
+        assertTrue("No dummy RecognitionService should be declared", recogMatches.isEmpty())
+
+        val overlayActivityInfo = pkgInfo.activities?.firstOrNull {
+            it.name == AssistantOverlayActivity::class.java.name
         }
-        assertNotNull("JarvisVoiceInteractionSessionService must be registered", sessionServiceInfo)
-        assertEquals(Manifest.permission.BIND_VOICE_INTERACTION, sessionServiceInfo?.permission)
+        assertNotNull("AssistantOverlayActivity must be registered", overlayActivityInfo)
+        assertTrue(overlayActivityInfo!!.exported)
+        assertEquals(android.content.pm.ActivityInfo.LAUNCH_SINGLE_INSTANCE, overlayActivityInfo.launchMode)
 
         val fgsInfo = pkgInfo.services?.firstOrNull {
             it.name == com.jarvis.app.platform.VoiceAssistantForegroundService::class.java.name
@@ -651,93 +669,29 @@ class JarvisCoreRobolectricTest {
     }
 
     @Test
-    fun `voice interaction session hides on back press without terminating active session`() {
+    fun `assistant overlay activity provides OnBackPressedDispatcherOwner and hides without killing active session`() {
         val app = ApplicationProvider.getApplicationContext<Application>()
         Shadows.shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
         val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)
         runtime.stopAssistant()
 
-        val serviceController = Robolectric.buildService(
-            com.jarvis.app.platform.JarvisVoiceInteractionSessionService::class.java
-        )
-        val sessionService = serviceController.create().get()
-        val session = sessionService.onNewSession(null) as com.jarvis.app.platform.JarvisVoiceInteractionSession
+        val controller = Robolectric.buildActivity(AssistantOverlayActivity::class.java, Intent(Intent.ACTION_ASSIST))
+        controller.create().start().resume()
+        val activity = controller.get()
         try {
-            session.onCreate()
-            val contentView = session.onCreateContentView()
-            assertNotNull(contentView)
-
-            // Simulate active session + visible voice-only UI then Back press
-            runtime.activateVoiceOnlyUi(AssistantLaunchIntentHelper.ACTION_VOICE_INTERACTION_SESSION, nowMs = 50_000L)
+            assertTrue(activity is androidx.activity.OnBackPressedDispatcherOwner)
+            assertNotNull(activity.onBackPressedDispatcher)
             assertTrue(runtime.isVoiceOnlyUiActive.value)
             assertTrue(runtime.isVoiceSessionActive.value)
 
-            session.onBackPressed()
+            activity.onVoiceOnlyBackPressed()
+
             assertFalse("Back must hide voice-only UI", runtime.isVoiceOnlyUiActive.value)
             assertTrue("Back must keep active voice session alive", runtime.isVoiceSessionActive.value)
-
-            runtime.stopAssistant()
-            assertFalse(runtime.isVoiceSessionActive.value)
+            assertTrue("Back must finish overlay activity cleanly", activity.isFinishing)
         } finally {
             runtime.stopAssistant()
-            session.onDestroy()
-            serviceController.destroy()
-        }
-    }
-
-    @Test
-    fun `voice interaction session provides OnBackPressedDispatcherOwner and safe BackHandler handling`() {
-        val app = ApplicationProvider.getApplicationContext<Application>()
-        Shadows.shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
-        val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)
-        runtime.stopAssistant()
-
-        val serviceController = Robolectric.buildService(
-            com.jarvis.app.platform.JarvisVoiceInteractionSessionService::class.java
-        )
-        val sessionService = serviceController.create().get()
-        val session = sessionService.onNewSession(null) as com.jarvis.app.platform.JarvisVoiceInteractionSession
-        try {
-            session.onCreate()
-            val contentView = session.onCreateContentView()
-            assertNotNull(contentView)
-            session.onPrepareShow(null, 0)
-            session.onShow(null, 0)
-
-            // Verify session implements OnBackPressedDispatcherOwner and tree owner is attached
-            assertTrue("Session must implement OnBackPressedDispatcherOwner", session is OnBackPressedDispatcherOwner)
-            val treeOwner = contentView.findViewTreeOnBackPressedDispatcherOwner()
-            assertEquals("ComposeView must have session as ViewTreeOnBackPressedDispatcherOwner", session, treeOwner)
-            assertNotNull("Session must provide non-null OnBackPressedDispatcher", session.onBackPressedDispatcher)
-
-            // Verify a custom back callback or BackHandler on dispatcher is invoked
-            var backCallbackInvoked = false
-            val callback = object : OnBackPressedCallback(true) {
-                override fun handleOnBackPressed() {
-                    backCallbackInvoked = true
-                }
-            }
-            session.onBackPressedDispatcher.addCallback(callback)
-            assertTrue("Dispatcher must have enabled callback", session.onBackPressedDispatcher.hasEnabledCallbacks())
-
-            session.onBackPressed()
-            assertTrue("onBackPressed must route to dispatcher and invoke active callback", backCallbackInvoked)
-
-            // When callback is removed, session fallback hides voice-only UI while keeping session alive
-            callback.remove()
-            assertFalse("Dispatcher should have no enabled callbacks after removal", session.onBackPressedDispatcher.hasEnabledCallbacks())
-
-            runtime.activateVoiceOnlyUi(AssistantLaunchIntentHelper.ACTION_VOICE_INTERACTION_SESSION, nowMs = 60_000L)
-            assertTrue(runtime.isVoiceOnlyUiActive.value)
-            assertTrue(runtime.isVoiceSessionActive.value)
-
-            session.onBackPressed()
-            assertFalse("Fallback back handling must hide voice-only UI", runtime.isVoiceOnlyUiActive.value)
-            assertTrue("Fallback back handling must preserve active voice session", runtime.isVoiceSessionActive.value)
-        } finally {
-            runtime.stopAssistant()
-            session.onDestroy()
-            serviceController.destroy()
+            controller.pause().stop().destroy()
         }
     }
 
@@ -765,35 +719,6 @@ class JarvisCoreRobolectricTest {
             assertTrue("Back press must invoke onHideKeepSession", hideCalled)
         } finally {
             activityController.pause().stop().destroy()
-        }
-    }
-
-    @Test
-    fun `voice interaction session keeps UI visible on missing mic permission instead of dismissing`() {
-        val app = ApplicationProvider.getApplicationContext<Application>()
-        Shadows.shadowOf(app).denyPermissions(Manifest.permission.RECORD_AUDIO)
-        val runtime = com.jarvis.app.platform.JarvisAssistantRuntime.getInstance(app)
-        runtime.stopAssistant()
-
-        val serviceController = Robolectric.buildService(
-            com.jarvis.app.platform.JarvisVoiceInteractionSessionService::class.java
-        )
-        val sessionService = serviceController.create().get()
-        val session = sessionService.onNewSession(null) as com.jarvis.app.platform.JarvisVoiceInteractionSession
-        try {
-            session.onCreate()
-            session.onPrepareShow(null, 0)
-            session.onShow(null, 0)
-
-            assertTrue("Voice-only UI must remain active even without mic permission so entrance animation is shown", runtime.isVoiceOnlyUiActive.value)
-            assertNotNull("Assistant launch event must be created", runtime.assistantLaunchEvent.value)
-            assertTrue("Banner should prompt for microphone permission", runtime.bannerMessage.value?.contains("permission", ignoreCase = true) == true)
-
-            runtime.stopAssistant()
-        } finally {
-            runtime.stopAssistant()
-            session.onDestroy()
-            serviceController.destroy()
         }
     }
 
@@ -833,6 +758,11 @@ class JarvisCoreRobolectricTest {
 
         val notif = Shadows.shadowOf(fgsController.get()).lastForegroundNotification
         assertNotNull("Ongoing foreground notification must be posted", notif)
+        assertEquals(
+            "Foreground notification must use monochrome vector smallIcon",
+            R.drawable.ic_stat_jarvis,
+            notif.smallIcon.resId
+        )
         val stopLabel = app.getString(R.string.action_stop_assistant)
         assertTrue(
             "Foreground notification must expose Stop Assistant action",

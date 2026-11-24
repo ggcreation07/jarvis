@@ -12,13 +12,11 @@ data class AssistantLaunchEvent(
 
 object AssistantLaunchIntentHelper {
     const val EXTRA_ASSIST_HANDLED = "com.jarvis.app.extra.ASSIST_LAUNCH_HANDLED"
-    const val ACTION_VOICE_INTERACTION_SESSION = "com.jarvis.app.action.VOICE_INTERACTION_SESSION"
     const val DUPLICATE_LAUNCH_DEBOUNCE_MS = 350L
 
     fun isAssistantAction(action: String?): Boolean =
         action == Intent.ACTION_ASSIST ||
-            action == Intent.ACTION_VOICE_COMMAND ||
-            action == ACTION_VOICE_INTERACTION_SESSION
+            action == Intent.ACTION_VOICE_COMMAND
 
     fun shouldHandleAssistantIntent(
         intent: Intent?,

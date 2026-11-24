@@ -187,12 +187,6 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     private var assistantLaunchCounter = 0L
     private var lastAssistantActivationMs = 0L
 
-    @Volatile
-    private var activeVoiceInteractionFinish: (() -> Unit)? = null
-
-    @Volatile
-    private var activeVoiceInteractionHide: (() -> Unit)? = null
-
     private val _handsFreeActivity = MutableStateFlow(HandsFreeActivity.READING)
     val handsFreeActivity: StateFlow<HandsFreeActivity> = _handsFreeActivity.asStateFlow()
 
@@ -347,19 +341,6 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
             context,
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
-
-    fun registerVoiceInteractionSession(
-        onHide: () -> Unit,
-        onFinish: () -> Unit
-    ) {
-        activeVoiceInteractionHide = onHide
-        activeVoiceInteractionFinish = onFinish
-    }
-
-    fun unregisterVoiceInteractionSession() {
-        activeVoiceInteractionHide = null
-        activeVoiceInteractionFinish = null
-    }
 
     fun deviceIdentity(): DeviceIdentityManager.Info = remotePcClient.deviceInfo()
 
@@ -883,7 +864,6 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
 
     fun exitVoiceOnlyUiForNormalHome() {
         _isVoiceOnlyUiActive.value = false
-        activeVoiceInteractionHide?.invoke()
     }
 
     fun stopAssistant() {
@@ -893,7 +873,6 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         toolExecutor.clearPendingConfirmation()
         stopCurrentWork()
         VoiceAssistantForegroundService.stop(context)
-        activeVoiceInteractionFinish?.invoke()
     }
 
     fun onActivityStopped() {

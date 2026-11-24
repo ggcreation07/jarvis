@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.Intent
 import androidx.test.core.app.ApplicationProvider
 import com.google.firebase.FirebaseApp
-import com.jarvis.app.platform.JarvisVoiceInteractionService
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -22,7 +21,7 @@ import org.robolectric.annotation.Config
 class Phase4dAppCheckRobolectricTest {
 
     @Test
-    fun `custom JarvisApplication initializes App Check at startup before VoiceInteractionService`() {
+    fun `custom JarvisApplication initializes App Check at startup before AssistantOverlayActivity`() {
         val app = ApplicationProvider.getApplicationContext<Application>()
         assertTrue("Manifest must instantiate JarvisApplication", app is JarvisApplication)
 
@@ -43,16 +42,19 @@ class Phase4dAppCheckRobolectricTest {
             )
         }
 
-        // Cold-starting VoiceInteractionService without MainActivity uses the already-initialized App Check
-        val installCountBeforeService = status.installCount
-        val serviceController = Robolectric.buildService(JarvisVoiceInteractionService::class.java)
-        serviceController.create()
+        // Cold-starting AssistantOverlayActivity without MainActivity uses the already-initialized App Check
+        val installCountBeforeAssist = status.installCount
+        val overlayController = Robolectric.buildActivity(
+            AssistantOverlayActivity::class.java,
+            Intent(Intent.ACTION_ASSIST)
+        )
+        overlayController.create()
         try {
-            val afterService = AppCheckManager.currentStatus()
-            assertTrue(afterService.initialized)
-            assertEquals(installCountBeforeService, afterService.installCount)
+            val afterAssist = AppCheckManager.currentStatus()
+            assertTrue(afterAssist.initialized)
+            assertEquals(installCountBeforeAssist, afterAssist.installCount)
         } finally {
-            serviceController.destroy()
+            overlayController.destroy()
         }
     }
 

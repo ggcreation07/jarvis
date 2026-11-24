@@ -83,17 +83,29 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
             <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".AssistantOverlayActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@style/Theme.JARVIS.AssistantOverlay">
+            <intent-filter>
                 <action android:name="android.intent.action.ASSIST" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VOICE_COMMAND" />
                 <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.SEND" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
 
@@ -129,24 +141,6 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/jarvis_accessibility_config" />
         </service>
-
-        <service
-            android:name=".platform.JarvisVoiceInteractionService"
-            android:exported="true"
-            android:label="@string/voice_service_label"
-            android:permission="android.permission.BIND_VOICE_INTERACTION">
-            <intent-filter>
-                <action android:name="android.service.voice.VoiceInteractionService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.voice_interaction"
-                android:resource="@xml/jarvis_voice_interaction" />
-        </service>
-
-        <service
-            android:name=".platform.JarvisVoiceInteractionSessionService"
-            android:exported="true"
-            android:permission="android.permission.BIND_VOICE_INTERACTION" />
 
         <service
             android:name=".platform.VoiceAssistantForegroundService"

@@ -57,6 +57,9 @@ object ToolConfirmationPolicy {
     private fun strArg(args: Map<String, JsonElement>, key: String): String =
         (args[key] as? JsonPrimitive)?.content?.trim().orEmpty()
 
+    private fun rawStrArg(args: Map<String, JsonElement>, key: String): String =
+        (args[key] as? JsonPrimitive)?.content.orEmpty()
+
     fun requiresConfirmation(toolName: String, args: Map<String, JsonElement>): Boolean {
         val normalized = toolName.trim()
         return when (normalized) {
@@ -92,6 +95,34 @@ object ToolConfirmationPolicy {
                 val goal = strArg(args, "goal")
                 val kind = strArg(args, "kind").ifBlank { "browser" }
                 isHighImpactPcTask(goal, kind)
+            }
+            "click_ui_element" -> {
+                if (strArg(args, "_requires_confirmation").equals("true", ignoreCase = true)) {
+                    true
+                } else {
+                    com.jarvis.app.platform.SensitiveUiActionPolicy.isSensitiveText(
+                        strArg(args, "text"),
+                        strArg(args, "content_description"),
+                        strArg(args, "hint"),
+                        strArg(args, "view_id"),
+                        strArg(args, "_resolved_label"),
+                        packageName = strArg(args, "_bound_package").ifBlank { strArg(args, "expected_package") }
+                    )
+                }
+            }
+            "type_text" -> {
+                if (strArg(args, "_requires_confirmation").equals("true", ignoreCase = true)) {
+                    true
+                } else {
+                    com.jarvis.app.platform.SensitiveUiActionPolicy.isSensitiveInputText(
+                        strArg(args, "target_text"),
+                        strArg(args, "content_description"),
+                        strArg(args, "hint"),
+                        strArg(args, "view_id"),
+                        strArg(args, "_resolved_label"),
+                        packageName = strArg(args, "_bound_package").ifBlank { strArg(args, "expected_package") }
+                    )
+                }
             }
             else -> false
         }
@@ -138,6 +169,41 @@ object ToolConfirmationPolicy {
                 "goal" to strArg(args, "goal").replace(Regex("\\s+"), " ").lowercase(Locale.ROOT),
                 "kind" to strArg(args, "kind").ifBlank { "browser" }.lowercase(Locale.ROOT)
             )
+            "click_ui_element" -> mapOf(
+                "action" to strArg(args, "_bound_action").ifBlank { "click" }.lowercase(Locale.ROOT),
+                "package" to strArg(args, "_bound_package").ifBlank { strArg(args, "expected_package") }.lowercase(Locale.ROOT),
+                "target_identity" to strArg(args, "_bound_fingerprint").ifBlank {
+                    listOf(
+                        strArg(args, "view_id"),
+                        strArg(args, "text"),
+                        strArg(args, "content_description"),
+                        strArg(args, "hint")
+                    ).joinToString("|")
+                }.lowercase(Locale.ROOT),
+                "text" to strArg(args, "text").lowercase(Locale.ROOT),
+                "content_description" to strArg(args, "content_description").lowercase(Locale.ROOT),
+                "view_id" to strArg(args, "view_id").lowercase(Locale.ROOT),
+                "hint" to strArg(args, "hint").lowercase(Locale.ROOT),
+                "class_name" to strArg(args, "class_name").lowercase(Locale.ROOT)
+            )
+            "type_text" -> mapOf(
+                "action" to strArg(args, "_bound_action").ifBlank { "type_text" }.lowercase(Locale.ROOT),
+                "package" to strArg(args, "_bound_package").ifBlank { strArg(args, "expected_package") }.lowercase(Locale.ROOT),
+                "field_identity" to strArg(args, "_bound_fingerprint").ifBlank {
+                    listOf(
+                        strArg(args, "view_id"),
+                        strArg(args, "target_text"),
+                        strArg(args, "content_description"),
+                        strArg(args, "hint")
+                    ).joinToString("|")
+                }.lowercase(Locale.ROOT),
+                "text" to rawStrArg(args, "text"),
+                "target_text" to strArg(args, "target_text").lowercase(Locale.ROOT),
+                "content_description" to strArg(args, "content_description").lowercase(Locale.ROOT),
+                "view_id" to strArg(args, "view_id").lowercase(Locale.ROOT),
+                "hint" to strArg(args, "hint").lowercase(Locale.ROOT),
+                "class_name" to strArg(args, "class_name").lowercase(Locale.ROOT)
+            )
             else -> args.entries
                 .sortedBy { it.key }
                 .associate { (k, v) ->
@@ -174,6 +240,34 @@ object ToolConfirmationPolicy {
                 val goal = strArg(args, "goal").ifBlank { "remote command" }.take(100)
                 val kind = strArg(args, "kind").ifBlank { "browser" }
                 "run the high-impact PC task \"$goal\" ($kind mode) on your paired Windows PC"
+            }
+            "click_ui_element" -> {
+                val label = strArg(args, "_resolved_label")
+                    .ifBlank { strArg(args, "text") }
+                    .ifBlank { strArg(args, "content_description") }
+                    .ifBlank { strArg(args, "view_id") }
+                    .ifBlank { "the selected UI element" }
+                    .replace(Regex("[\\u0000-\\u001F\\u007F]+"), " ")
+                    .take(80)
+                val pkg = strArg(args, "_bound_package").ifBlank { strArg(args, "expected_package") }
+                if (pkg.isNotBlank()) "click \"$label\" in $pkg" else "click \"$label\""
+            }
+            "type_text" -> {
+                val label = strArg(args, "_resolved_label")
+                    .ifBlank { strArg(args, "hint") }
+                    .ifBlank { strArg(args, "content_description") }
+                    .ifBlank { strArg(args, "view_id") }
+                    .ifBlank { strArg(args, "target_text") }
+                    .ifBlank { "the selected input field" }
+                    .replace(Regex("[\\u0000-\\u001F\\u007F]+"), " ")
+                    .take(80)
+                val charCount = rawStrArg(args, "text").length
+                val pkg = strArg(args, "_bound_package").ifBlank { strArg(args, "expected_package") }
+                if (pkg.isNotBlank()) {
+                    "enter text ($charCount chars) into \"$label\" in $pkg (without submitting)"
+                } else {
+                    "enter text ($charCount chars) into \"$label\" (without submitting)"
+                }
             }
             else -> "execute $normalizedTool"
         }

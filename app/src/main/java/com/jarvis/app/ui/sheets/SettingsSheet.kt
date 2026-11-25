@@ -85,6 +85,7 @@ fun SettingsSheet(
     val providerModels by viewModel.providerModels.collectAsStateWithLifecycle()
     val quotaSnapshots by viewModel.quotaSnapshots.collectAsStateWithLifecycle()
     val accessibilityEnabled by viewModel.accessibilityEnabled.collectAsStateWithLifecycle()
+    val accessibilityConnected by viewModel.accessibilityConnected.collectAsStateWithLifecycle()
     val notificationEnabled by viewModel.notificationAccessEnabled.collectAsStateWithLifecycle()
     val telemetry by viewModel.telemetryState.collectAsStateWithLifecycle()
 
@@ -549,12 +550,22 @@ fun SettingsSheet(
                                 }
                             }
 
+                            val accessibilityStatusText = when {
+                                accessibilityConnected -> "Connected"
+                                accessibilityEnabled -> "Enabled but disconnected — reconnect in Accessibility Settings"
+                                else -> "Not granted"
+                            }
+                            val accessibilityStatusColor = when {
+                                accessibilityConnected -> hud.success
+                                accessibilityEnabled -> hud.warning
+                                else -> hud.danger
+                            }
                             Text(
-                                text = "Accessibility Phone Control: ${if (accessibilityEnabled) "Granted" else "Not Granted"}",
+                                text = "Accessibility Phone Control: $accessibilityStatusText",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = if (accessibilityEnabled) hud.success else hud.danger
+                                color = accessibilityStatusColor
                             )
-                            if (!accessibilityEnabled) {
+                            if (!accessibilityConnected) {
                                 Button(
                                     onClick = { viewModel.openAccessibilitySettings() },
                                     colors = ButtonDefaults.buttonColors(containerColor = hud.accent, contentColor = hud.background)

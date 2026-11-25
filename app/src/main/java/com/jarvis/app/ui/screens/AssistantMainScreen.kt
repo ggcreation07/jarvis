@@ -133,7 +133,8 @@ import java.util.Locale
 @Composable
 fun AssistantMainScreen(
     viewModel: JarvisViewModel,
-    onRequestMicAndToggleVoice: () -> Unit
+    onRequestMicAndToggleVoice: () -> Unit,
+    onToggleVoiceMode: () -> Unit = {}
 ) {
     val hud = LocalJarvisColors.current
     val brainConfig by viewModel.brainConfig.collectAsStateWithLifecycle()
@@ -142,6 +143,7 @@ fun AssistantMainScreen(
     val archivedThreads by viewModel.archivedThreads.collectAsStateWithLifecycle()
     val isBusy by viewModel.isBusy.collectAsStateWithLifecycle()
     val status by viewModel.hudStatus.collectAsStateWithLifecycle()
+    val isVoiceSessionActive by viewModel.isVoiceSessionActive.collectAsStateWithLifecycle()
     val isListening by viewModel.voiceController.isListening.collectAsStateWithLifecycle()
     val isSpeaking by viewModel.voiceController.isSpeaking.collectAsStateWithLifecycle()
     val audioLevel by viewModel.voiceController.audioLevel.collectAsStateWithLifecycle()
@@ -235,6 +237,7 @@ fun AssistantMainScreen(
                 AssistantTopBar(
                     brainConfig = brainConfig,
                     status = status,
+                    isVoiceSessionActive = isVoiceSessionActive,
                     orbState = orbState,
                     audioLevel = audioLevel,
                     speakingLevel = speakingLevel,
@@ -242,10 +245,12 @@ fun AssistantMainScreen(
                     onOpenSidebar = { scope.launch { drawerState.open() } },
                     onOpenModePicker = { showModeSheet = true },
                     onVoiceShortcut = {
-                        if (status == HudStatus.LISTENING || status == HudStatus.SPEAKING || isBusy) {
+                        if (isVoiceSessionActive) {
+                            viewModel.stopAssistantSession()
+                        } else if (status == HudStatus.LISTENING || status == HudStatus.SPEAKING || isBusy) {
                             viewModel.stopCurrentWork()
                         } else {
-                            onRequestMicAndToggleVoice()
+                            onToggleVoiceMode()
                         }
                     },
                     onNewChat = { viewModel.startNewChat() }
@@ -377,6 +382,7 @@ fun AssistantMainScreen(
 private fun AssistantTopBar(
     brainConfig: BrainConfig,
     status: HudStatus,
+    isVoiceSessionActive: Boolean,
     orbState: OrbState,
     audioLevel: Float,
     speakingLevel: Float,
@@ -468,6 +474,7 @@ private fun AssistantTopBar(
                 }
             }
 
+            val voiceActiveOrStopping = isVoiceSessionActive || status == HudStatus.LISTENING || status == HudStatus.SPEAKING
             IconButton(
                 onClick = onVoiceShortcut,
                 modifier = Modifier
@@ -475,9 +482,9 @@ private fun AssistantTopBar(
                     .testTag("main_voice_mode_button")
             ) {
                 Icon(
-                    imageVector = if (status == HudStatus.LISTENING || status == HudStatus.SPEAKING) Icons.Rounded.Stop else Icons.Rounded.GraphicEq,
+                    imageVector = if (voiceActiveOrStopping) Icons.Rounded.Stop else Icons.Rounded.GraphicEq,
                     contentDescription = stringResource(R.string.cd_voice_mode),
-                    tint = if (status == HudStatus.LISTENING || status == HudStatus.SPEAKING) hud.danger else hud.textSecondary
+                    tint = if (voiceActiveOrStopping) hud.danger else hud.textSecondary
                 )
             }
 

@@ -46,12 +46,13 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.jarvis.app.domain.model.HudStatus
 import com.jarvis.app.domain.model.OverlayType
 import com.jarvis.app.platform.RoutineAlarms
 import com.jarvis.app.ui.JarvisViewModel
-import com.jarvis.app.ui.components.AssistantLaunchEntranceOverlay
 import com.jarvis.app.ui.components.resolveOrbState
 import com.jarvis.app.ui.screens.AssistantMainScreen
+import com.jarvis.app.ui.screens.VoiceOnlyAssistantScreen
 import com.jarvis.app.ui.sheets.CapabilitiesSheet
 import com.jarvis.app.ui.sheets.CommandPaletteDialog
 import com.jarvis.app.ui.sheets.CustomizeSheet
@@ -70,7 +71,7 @@ import com.jarvis.app.ui.theme.LocalJarvisColors
 
 class MainActivity : ComponentActivity() {
 
-    private val viewModel: JarvisViewModel by viewModels()
+    private val viewModel: JarvisViewModel by viewModels { JarvisViewModel.factory(application) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -83,7 +84,6 @@ class MainActivity : ComponentActivity() {
             val screenConfig by viewModel.screenConfig.collectAsStateWithLifecycle()
             val activeOverlay by viewModel.activeOverlay.collectAsStateWithLifecycle()
             val bannerMessage by viewModel.bannerMessage.collectAsStateWithLifecycle()
-            val assistantLaunchEvent by viewModel.assistantLaunchEvent.collectAsStateWithLifecycle()
             val isVoiceOnlyUiActive by viewModel.isVoiceOnlyUiActive.collectAsStateWithLifecycle()
             val isVoiceSessionActive by viewModel.isVoiceSessionActive.collectAsStateWithLifecycle()
             val isListening by viewModel.voiceController.isListening.collectAsStateWithLifecycle()
@@ -101,6 +101,16 @@ class MainActivity : ComponentActivity() {
                     viewModel.toggleVoiceInput()
                 } else {
                     viewModel.showBanner("Microphone permission is needed for voice input.")
+                }
+            }
+
+            val voiceModeMicPermissionLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                if (granted) {
+                    viewModel.startInAppVoiceMode()
+                } else {
+                    viewModel.showBanner("Microphone permission is needed for Voice Mode.")
                 }
             }
 
@@ -138,6 +148,18 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            val requestMicAndStartInAppVoiceMode: () -> Unit = {
+                val hasMic = ContextCompat.checkSelfPermission(
+                    this@MainActivity,
+                    Manifest.permission.RECORD_AUDIO
+                ) == PackageManager.PERMISSION_GRANTED
+                if (hasMic) {
+                    viewModel.startInAppVoiceMode()
+                } else {
+                    voiceModeMicPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                }
+            }
+
             val currentOrbState = remember(isListening, isSpeaking, isBusy, hudStatus) {
                 resolveOrbState(
                     isListening = isListening,
@@ -150,10 +172,32 @@ class MainActivity : ComponentActivity() {
             JarvisTheme(screenConfig = screenConfig) {
                 val hud = LocalJarvisColors.current
                 Box(modifier = Modifier.fillMaxSize()) {
-                    AssistantMainScreen(
-                        viewModel = viewModel,
-                        onRequestMicAndToggleVoice = requestMicAndToggleVoice
-                    )
+                    if (isVoiceOnlyUiActive) {
+                        VoiceOnlyAssistantScreen(
+                            orbState = currentOrbState,
+                            audioLevel = audioLevel,
+                            speakingLevel = speakingLevel,
+                            launchEvent = null,
+                            translucentOverlay = false,
+                            onEntranceCompleted = { id -> viewModel.markAssistantEntranceCompleted(id) },
+                            onOrbClick = {
+                                if (hudStatus == HudStatus.SPEAKING && !isBusy) {
+                                    viewModel.interruptSpeechAndListen()
+                                } else if (hudStatus == HudStatus.LISTENING || isBusy) {
+                                    viewModel.stopCurrentWork()
+                                } else {
+                                    requestMicAndStartInAppVoiceMode()
+                                }
+                            },
+                            onHideKeepSession = { viewModel.stopAssistantSession() },
+                            onStopAssistant = { viewModel.stopAssistantSession() }
+                        )
+                    } else {
+                        AssistantMainScreen(
+                            viewModel = viewModel,
+                            onRequestMicAndToggleVoice = requestMicAndToggleVoice,
+                            onToggleVoiceMode = requestMicAndStartInAppVoiceMode
+                        )
 
                         if (isVoiceSessionActive) {
                             Row(
@@ -183,9 +227,10 @@ class MainActivity : ComponentActivity() {
                                     color = hud.textPrimary
                                 )
                             }
-                        }
+                    }
+                    }
 
-                        AnimatedVisibility(
+                    AnimatedVisibility(
                             visible = activeOverlay != OverlayType.NONE,
                             enter = fadeIn(),
                             exit = fadeOut()
@@ -247,20 +292,8 @@ class MainActivity : ComponentActivity() {
                                     onClose = { viewModel.closeOverlay() }
                                 )
                                 OverlayType.NONE -> Unit
-                            }
                         }
-
-                        assistantLaunchEvent
-                            ?.takeIf { !it.entranceCompleted }
-                            ?.let { event ->
-                                AssistantLaunchEntranceOverlay(
-                                    event = event,
-                                    orbState = currentOrbState,
-                                    audioLevel = audioLevel,
-                                    speakingLevel = speakingLevel,
-                                    onEntranceCompleted = { id -> viewModel.markAssistantEntranceCompleted(id) }
-                                )
-                            }
+                    }
 
                     SnackbarHost(
                         hostState = snackbarHostState,

@@ -106,11 +106,28 @@ object DirectCommandMatcher {
             return DirectActionMatch.ToolCall("set_timer", mapOf("seconds" to secs.toString()))
         }
 
+        // Global Android navigation (Accessibility Service) - must precede generic openApp rule
+        if (Regex("^(?:(?:go|navigate|press|tap)\\s+)?back(?:\\s+button)?$").matches(lower)) {
+            return DirectActionMatch.ToolCall("accessibility_navigate", mapOf("action" to "back"))
+        }
+        if (Regex("^(?:go(?:\\s+to(?:\\s+the)?)?\\s+home(?:\\s+screen)?|return\\s+home|(?:press|tap)\\s+home(?:\\s+button)?|home\\s+screen)$").matches(lower)) {
+            return DirectActionMatch.ToolCall("accessibility_navigate", mapOf("action" to "home"))
+        }
+        if (Regex("^(?:(?:open|show|view)\\s+(?:the\\s+)?(?:recents|recent\\s+apps|app\\s+switcher)|(?:press|tap)\\s+recents(?:\\s+button)?)$").matches(lower)) {
+            return DirectActionMatch.ToolCall("accessibility_navigate", mapOf("action" to "recents"))
+        }
+        if (Regex("^(?:(?:open|show|pull\\s+down|expand)\\s+(?:the\\s+)?(?:notifications?|notification\\s+(?:panel|shade|drawer|bar)))$").matches(lower)) {
+            return DirectActionMatch.ToolCall("accessibility_navigate", mapOf("action" to "notifications"))
+        }
+        if (Regex("^(?:(?:open|show|pull\\s+down|expand)\\s+(?:the\\s+)?quick\\s+settings(?:\\s+(?:panel|shade|drawer))?)$").matches(lower)) {
+            return DirectActionMatch.ToolCall("accessibility_navigate", mapOf("action" to "quick_settings"))
+        }
+
         // Quick Open App: "open Spotify"
         val openApp = Regex("^open ([a-z0-9 ._-]{2,28})$", RegexOption.IGNORE_CASE).find(text)
         if (openApp != null) {
             val appName = openApp.groupValues[1].trim()
-            if (appName.lowercase() !in setOf("chat", "settings", "memory", "skills", "capabilities", "customize", "power", "remote", "conversation")) {
+            if (appName.lowercase() !in setOf("chat", "settings", "memory", "skills", "capabilities", "customize", "power", "remote", "conversation", "recents", "notifications", "quick settings")) {
                 return DirectActionMatch.ToolCall("open_application", mapOf("name" to appName))
             }
         }

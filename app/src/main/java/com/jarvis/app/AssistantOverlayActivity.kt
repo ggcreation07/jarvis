@@ -34,7 +34,7 @@ import com.jarvis.app.ui.theme.JarvisTheme
 
 class AssistantOverlayActivity : ComponentActivity() {
 
-    private val viewModel: JarvisViewModel by viewModels()
+    private val viewModel: JarvisViewModel by viewModels { JarvisViewModel.factory(application) }
 
     private val assistantMicPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -109,7 +109,9 @@ class AssistantOverlayActivity : ComponentActivity() {
                         translucentOverlay = true,
                         onEntranceCompleted = { id -> viewModel.markAssistantEntranceCompleted(id) },
                         onOrbClick = {
-                            if (hudStatus == HudStatus.LISTENING || hudStatus == HudStatus.SPEAKING || isBusy) {
+                            if (hudStatus == HudStatus.SPEAKING && !isBusy) {
+                                viewModel.interruptSpeechAndListen()
+                            } else if (hudStatus == HudStatus.LISTENING || isBusy) {
                                 viewModel.stopCurrentWork()
                             } else {
                                 val hasMic = ContextCompat.checkSelfPermission(

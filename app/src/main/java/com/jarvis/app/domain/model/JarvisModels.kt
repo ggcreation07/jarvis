@@ -126,6 +126,7 @@ data class BrainConfig(
     val selectedAgentId: String = "auto",
     val voiceTtsEnabled: Boolean = true,
     val muted: Boolean = false,
+    val voiceBargeInEnabled: Boolean = false,
     val wakeSensitivity: Int = 60,
     val calendarSyncEnabled: Boolean = false,
     val nightlyDigestEnabled: Boolean = true,

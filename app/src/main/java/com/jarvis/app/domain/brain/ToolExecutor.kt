@@ -1,5 +1,6 @@
 package com.jarvis.app.domain.brain
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.provider.Settings
 import com.jarvis.app.data.ai.FirebaseAiService
@@ -9,15 +10,28 @@ import com.jarvis.app.data.local.JarvisRepository
 import com.jarvis.app.data.network.JarvisHttpTools
 import com.jarvis.app.domain.model.OverlayType
 import com.jarvis.app.domain.model.RoutineItem
+import com.jarvis.app.platform.ClickPrecheckOutcome
+import com.jarvis.app.platform.ClickUiElementResult
 import com.jarvis.app.platform.DeviceController
 import com.jarvis.app.platform.DeviceTelemetry
+import com.jarvis.app.platform.FindUiElementsResult
+import com.jarvis.app.platform.JarvisAccessibilityService
 import com.jarvis.app.platform.JarvisNotificationListener
 import com.jarvis.app.platform.RemotePcClient
 import com.jarvis.app.platform.RoutineAlarms
+import com.jarvis.app.platform.ScreenInteractionStatus
+import com.jarvis.app.platform.ScreenReadErrorCode
+import com.jarvis.app.platform.ScreenReadResult
+import com.jarvis.app.platform.ScreenReaderEngine
+import com.jarvis.app.platform.ScrollUiResult
 import com.jarvis.app.platform.TvControlClient
+import com.jarvis.app.platform.TypeTextPrecheckOutcome
+import com.jarvis.app.platform.TypeTextResult
+import com.jarvis.app.platform.UiElementQuery
 import com.jarvis.app.platform.WakeOnLan
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -35,6 +49,25 @@ data class ToolSideEffects(
     val runRoutinePrompt: String? = null
 )
 
+interface AccessibilityNavigationBridge {
+    fun isSettingsEnabled(): Boolean
+    fun isServiceConnected(): Boolean
+    fun performAction(action: String): Boolean?
+}
+
+interface AccessibilityScreenReaderBridge {
+    suspend fun readScreen(): ScreenReadResult
+}
+
+interface AccessibilityInteractionBridge {
+    suspend fun findElements(query: UiElementQuery): FindUiElementsResult
+    suspend fun inspectForClick(query: UiElementQuery): ClickPrecheckOutcome
+    suspend fun clickElement(query: UiElementQuery): ClickUiElementResult
+    suspend fun inspectForTypeText(query: UiElementQuery, textToEnter: String): TypeTextPrecheckOutcome
+    suspend fun typeText(query: UiElementQuery, textToEnter: String): TypeTextResult
+    suspend fun scrollContainer(query: UiElementQuery, direction: String): ScrollUiResult
+}
+
 class ToolExecutor(
     private val repository: JarvisRepository,
     private val configStore: ConfigStore,
@@ -45,8 +78,228 @@ class ToolExecutor(
     private val remotePcClient: RemotePcClient,
     private val tvControlClient: TvControlClient,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
-    private val confirmationTimeoutMs: Long = ToolConfirmationPolicy.DEFAULT_CONFIRMATION_TIMEOUT_MS
+    private val confirmationTimeoutMs: Long = ToolConfirmationPolicy.DEFAULT_CONFIRMATION_TIMEOUT_MS,
+    private val appContext: Context? = null,
+    private val accessibilityBridge: AccessibilityNavigationBridge? = null,
+    private val screenReaderBridge: AccessibilityScreenReaderBridge? = null,
+    private val interactionBridge: AccessibilityInteractionBridge? = null
 ) {
+    private fun navBridge(): AccessibilityNavigationBridge = accessibilityBridge ?: object : AccessibilityNavigationBridge {
+        override fun isSettingsEnabled(): Boolean =
+            appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
+
+        override fun isServiceConnected(): Boolean =
+            JarvisAccessibilityService.isConnectedNow()
+
+        override fun performAction(action: String): Boolean? {
+            val service = JarvisAccessibilityService.instance
+            if (service == null || !JarvisAccessibilityService.isConnected) return false
+            return service.performNavigationAction(action)
+        }
+    }
+
+    /**
+     * Phase 2 internal screen-reading API (not exposed to Firebase AI tool declarations yet).
+     */
+    internal suspend fun readScreen(): ToolCallExecutionResult {
+        val result = readScreenRaw()
+        val callResult = when (result) {
+            is ScreenReadResult.Success -> {
+                val payloadText = result.snapshot.toUntrustedDataBlock()
+                ToolCallExecutionResult(
+                    toolName = "read_screen",
+                    ok = true,
+                    summary = payloadText,
+                    payload = buildJsonObject {
+                        put("status", "ok")
+                        put("trust", result.snapshot.trustLevel)
+                        put("untrusted", true)
+                        put("package_name", result.snapshot.packageName)
+                        put("node_count", result.snapshot.nodes.size)
+                        put("max_depth_reached", result.snapshot.maxDepthReached)
+                        put("truncated", result.snapshot.truncated)
+                        put("data", payloadText)
+                    }
+                )
+            }
+            is ScreenReadResult.Error -> {
+                ToolCallExecutionResult(
+                    toolName = "read_screen",
+                    ok = false,
+                    summary = result.message,
+                    payload = buildJsonObject {
+                        put("status", "failed")
+                        put("error_code", result.code.name)
+                        put("trust", ScreenReaderEngine.UNTRUSTED_TRUST_LABEL)
+                        put("untrusted", true)
+                    }
+                )
+            }
+        }
+        val auditSummary = when (result) {
+            is ScreenReadResult.Success ->
+                "Read external screen (${result.snapshot.packageName}, ${result.snapshot.nodes.size} nodes)"
+            is ScreenReadResult.Error -> result.message
+        }
+        repository.logAction(callResult.toolName, auditSummary, callResult.ok)
+        return callResult
+    }
+
+    internal suspend fun readScreenRaw(): ScreenReadResult {
+        val bridge = screenReaderBridge
+        if (bridge != null) {
+            return bridge.readScreen()
+        }
+        val service = JarvisAccessibilityService.instance
+        if (service == null || !JarvisAccessibilityService.isConnected) {
+            val enabled = appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
+            return if (enabled) {
+                ScreenReadResult.Error(
+                    code = ScreenReadErrorCode.SERVICE_ENABLED_BUT_DISCONNECTED,
+                    message = "Accessibility Phone Control is enabled in Android Settings, but the service is disconnected. Reconnect JARVIS Phone Control in Accessibility Settings."
+                )
+            } else {
+                ScreenReadResult.Error(
+                    code = ScreenReadErrorCode.SERVICE_NOT_CONNECTED,
+                    message = "Accessibility Phone Control isn't connected yet. Enable JARVIS Phone Control in Android Accessibility Settings."
+                )
+            }
+        }
+        return service.readScreen()
+    }
+
+    private fun parseUiQuery(args: Map<String, JsonElement>): UiElementQuery = UiElementQuery(
+        text = strArg(args, "text"),
+        contentDescription = strArg(args, "content_description"),
+        viewId = strArg(args, "view_id"),
+        hint = strArg(args, "hint"),
+        className = strArg(args, "class_name"),
+        expectedPackage = strArg(args, "expected_package").ifBlank { strArg(args, "package_name") },
+        expectedFingerprint = strArg(args, "expected_fingerprint"),
+        clickableOnly = (args["clickable_only"] as? JsonPrimitive)?.booleanOrNull ?: false
+    )
+
+    private fun parseTypeTextQuery(args: Map<String, JsonElement>): UiElementQuery = UiElementQuery(
+        text = strArg(args, "target_text"),
+        contentDescription = strArg(args, "content_description"),
+        viewId = strArg(args, "view_id"),
+        hint = strArg(args, "hint"),
+        className = strArg(args, "class_name"),
+        expectedPackage = strArg(args, "expected_package").ifBlank { strArg(args, "package_name") },
+        expectedFingerprint = strArg(args, "expected_fingerprint"),
+        clickableOnly = false
+    )
+
+    private suspend fun findUiElementsRaw(query: UiElementQuery): FindUiElementsResult {
+        interactionBridge?.let { return it.findElements(query) }
+        val service = JarvisAccessibilityService.instance
+        if (service == null || !JarvisAccessibilityService.isConnected) {
+            val enabled = appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
+            val msg = if (enabled) {
+                "Accessibility Phone Control is enabled in Android Settings, but the service is disconnected. Reconnect JARVIS Phone Control in Accessibility Settings."
+            } else {
+                "Accessibility Phone Control isn't connected yet. Enable JARVIS Phone Control in Android Accessibility Settings."
+            }
+            return FindUiElementsResult(ScreenInteractionStatus.SERVICE_DISCONNECTED, msg)
+        }
+        return service.findUiElements(query)
+    }
+
+    private suspend fun inspectClickCandidateRaw(query: UiElementQuery): ClickPrecheckOutcome {
+        interactionBridge?.let { return it.inspectForClick(query) }
+        val service = JarvisAccessibilityService.instance
+        if (service == null || !JarvisAccessibilityService.isConnected) {
+            val enabled = appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
+            val msg = if (enabled) {
+                "Accessibility Phone Control is enabled in Android Settings, but the service is disconnected. Reconnect JARVIS Phone Control in Accessibility Settings."
+            } else {
+                "Accessibility Phone Control isn't connected yet. Enable JARVIS Phone Control in Android Accessibility Settings."
+            }
+            return ClickPrecheckOutcome.Failed(ScreenInteractionStatus.SERVICE_DISCONNECTED, msg)
+        }
+        return service.inspectClickCandidate(query)
+    }
+
+    private suspend fun clickUiElementRaw(query: UiElementQuery): ClickUiElementResult {
+        interactionBridge?.let { return it.clickElement(query) }
+        val service = JarvisAccessibilityService.instance
+        if (service == null || !JarvisAccessibilityService.isConnected) {
+            val enabled = appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
+            val msg = if (enabled) {
+                "Accessibility Phone Control is enabled in Android Settings, but the service is disconnected. Reconnect JARVIS Phone Control in Accessibility Settings."
+            } else {
+                "Accessibility Phone Control isn't connected yet. Enable JARVIS Phone Control in Android Accessibility Settings."
+            }
+            return ClickUiElementResult(ScreenInteractionStatus.SERVICE_DISCONNECTED, msg)
+        }
+        return service.clickUiElement(query)
+    }
+
+    private suspend fun inspectTypeTextCandidateRaw(
+        query: UiElementQuery,
+        textToEnter: String
+    ): TypeTextPrecheckOutcome {
+        interactionBridge?.let { return it.inspectForTypeText(query, textToEnter) }
+        val service = JarvisAccessibilityService.instance
+        if (service == null || !JarvisAccessibilityService.isConnected) {
+            val enabled = appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
+            val msg = if (enabled) {
+                "Accessibility Phone Control is enabled in Android Settings, but the service is disconnected. Reconnect JARVIS Phone Control in Accessibility Settings."
+            } else {
+                "Accessibility Phone Control isn't connected yet. Enable JARVIS Phone Control in Android Accessibility Settings."
+            }
+            return TypeTextPrecheckOutcome.Failed(ScreenInteractionStatus.SERVICE_DISCONNECTED, msg)
+        }
+        return service.inspectTypeTextCandidate(query, textToEnter)
+    }
+
+    private suspend fun typeTextRaw(query: UiElementQuery, textToEnter: String): TypeTextResult {
+        interactionBridge?.let { return it.typeText(query, textToEnter) }
+        val service = JarvisAccessibilityService.instance
+        if (service == null || !JarvisAccessibilityService.isConnected) {
+            val enabled = appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
+            val msg = if (enabled) {
+                "Accessibility Phone Control is enabled in Android Settings, but the service is disconnected. Reconnect JARVIS Phone Control in Accessibility Settings."
+            } else {
+                "Accessibility Phone Control isn't connected yet. Enable JARVIS Phone Control in Android Accessibility Settings."
+            }
+            return TypeTextResult(ScreenInteractionStatus.SERVICE_DISCONNECTED, msg)
+        }
+        return service.typeTextInUiElement(query, textToEnter)
+    }
+
+    private suspend fun scrollContainerRaw(query: UiElementQuery, direction: String): ScrollUiResult {
+        interactionBridge?.let { return it.scrollContainer(query, direction) }
+        val service = JarvisAccessibilityService.instance
+        if (service == null || !JarvisAccessibilityService.isConnected) {
+            val enabled = appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
+            val msg = if (enabled) {
+                "Accessibility Phone Control is enabled in Android Settings, but the service is disconnected. Reconnect JARVIS Phone Control in Accessibility Settings."
+            } else {
+                "Accessibility Phone Control isn't connected yet. Enable JARVIS Phone Control in Android Accessibility Settings."
+            }
+            return ScrollUiResult(ScreenInteractionStatus.SERVICE_DISCONNECTED, msg)
+        }
+        return service.scrollUiContainer(query, direction)
+    }
+
+    private fun screenInteractionFailure(
+        toolName: String,
+        status: ScreenInteractionStatus,
+        message: String,
+        packageName: String = ""
+    ) = ToolCallExecutionResult(
+        toolName = toolName,
+        ok = false,
+        summary = message,
+        payload = buildJsonObject {
+            put("status", "failed")
+            put("result_code", status.name)
+            put("trust", ScreenReaderEngine.UNTRUSTED_TRUST_LABEL)
+            put("untrusted", true)
+            if (packageName.isNotBlank()) put("package_name", packageName)
+        }
+    )
     private class ConfirmedGrant(
         val binding: ActionBindingKey,
         val expiresAtMs: Long
@@ -64,6 +317,18 @@ class ToolExecutor(
         }
     }
 
+    val uiTaskExecutionEngine: UiTaskExecutionEngine by lazy { UiTaskExecutionEngine(this) }
+
+    val taskContextStore: TaskContextStore get() = uiTaskExecutionEngine.taskContextStore
+
+    fun pauseActiveUiTask(): Boolean = uiTaskExecutionEngine.pauseActiveTask()
+
+    suspend fun resumeActiveUiTask(
+        onProgress: suspend (TaskProgressEvent) -> Unit = {}
+    ): TaskExecutionReport = uiTaskExecutionEngine.resumeActiveTask(onProgress)
+
+    fun cancelActiveUiTask(): Boolean = uiTaskExecutionEngine.cancelActiveTask()
+
     fun getPendingConfirmation(): PendingProtectedAction? = synchronized(confirmationLock) {
         pendingConfirmation?.takeIf { nowMs() <= it.expiresAtMs }
     }
@@ -71,6 +336,10 @@ class ToolExecutor(
     fun clearPendingConfirmation() {
         synchronized(confirmationLock) {
             pendingConfirmation = null
+        }
+        uiTaskExecutionEngine.clearPendingContinuation()
+        if (uiTaskExecutionEngine.taskContextStore.getActiveContext()?.state == TaskLifecycleState.AWAITING_CONFIRMATION) {
+            uiTaskExecutionEngine.taskContextStore.cancelTask("Pending confirmation cleared or superseded.")
         }
     }
 
@@ -95,6 +364,10 @@ class ToolExecutor(
 
         val intent = ConfirmationClassifier.classify(rawInput)
         if (isExpired) {
+            uiTaskExecutionEngine.clearPendingContinuation()
+            if (uiTaskExecutionEngine.taskContextStore.getActiveContext()?.state == TaskLifecycleState.AWAITING_CONFIRMATION) {
+                uiTaskExecutionEngine.taskContextStore.cancelTask("Confirmation expired.")
+            }
             return when (intent) {
                 ConfirmationIntent.CANCEL -> ConfirmationTurnOutcome.Cancelled(
                     actionDescription = current.description,
@@ -144,6 +417,7 @@ class ToolExecutor(
                     }
                 }
                 if (pair == null) {
+                    clearPendingConfirmation()
                     return ConfirmationTurnOutcome.Expired(
                         actionDescription = current.description,
                         replyText = ToolConfirmationPolicy.buildExpiredReply(current.description, rawInput)
@@ -163,6 +437,9 @@ class ToolExecutor(
 
     private fun strArg(args: Map<String, JsonElement>, key: String): String =
         (args[key] as? JsonPrimitive)?.content?.trim().orEmpty()
+
+    private fun rawStrArg(args: Map<String, JsonElement>, key: String): String =
+        (args[key] as? JsonPrimitive)?.content.orEmpty()
 
     private fun intArg(args: Map<String, JsonElement>, key: String): Int? =
         (args[key] as? JsonPrimitive)?.intOrNull
@@ -185,10 +462,64 @@ class ToolExecutor(
         authorizedGrant: ConfirmedGrant?
     ): ToolCallExecutionResult {
         val normalizedName = toolName.trim()
-        if (ToolConfirmationPolicy.requiresConfirmation(normalizedName, args)) {
+        val sanitizedInputArgs = if (authorizedGrant == null) {
+            args.filterKeys { !it.startsWith("_") }
+        } else {
+            args
+        }
+        var effectiveArgs = sanitizedInputArgs
+        if (normalizedName == "click_ui_element" && authorizedGrant == null) {
+            val query = parseUiQuery(sanitizedInputArgs)
+            when (val precheck = inspectClickCandidateRaw(query)) {
+                is ClickPrecheckOutcome.Failed -> {
+                    val failedRes = screenInteractionFailure(
+                        toolName = "click_ui_element",
+                        status = precheck.status,
+                        message = precheck.message,
+                        packageName = precheck.packageName
+                    )
+                    repository.logAction("click_ui_element", failedRes.summary, false)
+                    return failedRes
+                }
+                is ClickPrecheckOutcome.Ready -> {
+                    effectiveArgs = sanitizedInputArgs.toMutableMap().apply {
+                        put("_bound_action", JsonPrimitive("click"))
+                        put("_bound_package", JsonPrimitive(precheck.candidate.packageName))
+                        put("_bound_fingerprint", JsonPrimitive(precheck.candidate.fingerprint))
+                        put("_resolved_label", JsonPrimitive(precheck.candidate.displayLabel))
+                        put("_requires_confirmation", JsonPrimitive(precheck.candidate.isSensitive.toString()))
+                    }
+                }
+            }
+        } else if (normalizedName == "type_text" && authorizedGrant == null) {
+            val query = parseTypeTextQuery(sanitizedInputArgs)
+            val textToEnter = rawStrArg(sanitizedInputArgs, "text")
+            when (val precheck = inspectTypeTextCandidateRaw(query, textToEnter)) {
+                is TypeTextPrecheckOutcome.Failed -> {
+                    val failedRes = screenInteractionFailure(
+                        toolName = "type_text",
+                        status = precheck.status,
+                        message = precheck.message,
+                        packageName = precheck.packageName
+                    )
+                    repository.logAction("type_text", failedRes.summary, false)
+                    return failedRes
+                }
+                is TypeTextPrecheckOutcome.Ready -> {
+                    effectiveArgs = sanitizedInputArgs.toMutableMap().apply {
+                        put("_bound_action", JsonPrimitive("type_text"))
+                        put("_bound_package", JsonPrimitive(precheck.candidate.packageName))
+                        put("_bound_fingerprint", JsonPrimitive(precheck.candidate.fingerprint))
+                        put("_resolved_label", JsonPrimitive(precheck.candidate.displayLabel))
+                        put("_requires_confirmation", JsonPrimitive(precheck.candidate.isSensitive.toString()))
+                    }
+                }
+            }
+        }
+        if (ToolConfirmationPolicy.requiresConfirmation(normalizedName, effectiveArgs)) {
             val binding = ActionBindingKey(
                 toolName = normalizedName,
-                canonicalArgs = ToolConfirmationPolicy.canonicalizeArgs(normalizedName, args)
+                canonicalArgs = ToolConfirmationPolicy.canonicalizeArgs(normalizedName, effectiveArgs)
             )
             var blockedId = ""
             var blockedDescription = ""
@@ -205,12 +536,12 @@ class ToolExecutor(
                     pendingConfirmation = null
                 } else {
                     val id = "confirm_${nextConfirmationSeq++}"
-                    val description = ToolConfirmationPolicy.describeProtectedAction(normalizedName, args)
+                    val description = ToolConfirmationPolicy.describeProtectedAction(normalizedName, effectiveArgs)
                     pendingConfirmation = PendingProtectedAction(
                         id = id,
                         binding = binding,
                         description = description,
-                        originalArgs = args.toMap(),
+                        originalArgs = effectiveArgs.toMap(),
                         createdAtMs = now,
                         expiresAtMs = now + confirmationTimeoutMs
                     )
@@ -547,6 +878,210 @@ class ToolExecutor(
                     else -> ok("control_interface", "Handled UI action $action.")
                 }
             }
+            "accessibility_navigate" -> {
+                val rawAction = strArg(args, "action").lowercase().replace("-", "_").replace(" ", "_")
+                val action = when (rawAction) {
+                    "back", "home", "recents", "notifications", "quick_settings" -> rawAction
+                    "notification", "notification_panel", "notifications_panel", "notification_shade" -> "notifications"
+                    "quicksettings", "quick_settings_panel", "quick_setting" -> "quick_settings"
+                    "recent", "recent_apps" -> "recents"
+                    else -> rawAction
+                }
+                if (action !in setOf("back", "home", "recents", "notifications", "quick_settings")) {
+                    fail("accessibility_navigate", "Unsupported accessibility navigation action: '$rawAction'.")
+                } else {
+                    val bridge = navBridge()
+                    if (!bridge.isServiceConnected()) {
+                        if (bridge.isSettingsEnabled()) {
+                            fail(
+                                "accessibility_navigate",
+                                "Accessibility Phone Control is enabled in Android Settings, but the service is disconnected. Reconnect JARVIS Phone Control in Accessibility Settings."
+                            )
+                        } else {
+                            fail(
+                                "accessibility_navigate",
+                                "Accessibility Phone Control isn't connected yet. Enable JARVIS Phone Control in Android Accessibility Settings."
+                            )
+                        }
+                    } else {
+                        val performed = try {
+                            bridge.performAction(action)
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (performed == true) {
+                            val msg = when (action) {
+                                "back" -> "Navigated back."
+                                "home" -> "Navigated to Home screen."
+                                "recents" -> "Opened Recent apps."
+                                "notifications" -> "Opened Notifications panel."
+                                "quick_settings" -> "Opened Quick Settings panel."
+                                else -> "Performed $action."
+                            }
+                            ok("accessibility_navigate", msg)
+                        } else {
+                            fail(
+                                "accessibility_navigate",
+                                "Couldn't perform '$action' because the system rejected the accessibility global action."
+                            )
+                        }
+                    }
+                }
+            }
+            "read_screen" -> {
+                return readScreen()
+            }
+            "find_ui_element" -> {
+                val query = parseUiQuery(effectiveArgs)
+                val found = findUiElementsRaw(query)
+                val isOk = found.status == ScreenInteractionStatus.SUCCESS
+                val untrustedData = found.toUntrustedDataBlock()
+                ToolCallExecutionResult(
+                    toolName = "find_ui_element",
+                    ok = isOk,
+                    summary = if (isOk) untrustedData else "${found.message}\n$untrustedData",
+                    payload = buildJsonObject {
+                        put("status", if (isOk) "ok" else "failed")
+                        put("result_code", found.status.name)
+                        put("trust", ScreenReaderEngine.UNTRUSTED_TRUST_LABEL)
+                        put("untrusted", true)
+                        put("package_name", found.packageName)
+                        put("match_count", found.matches.size)
+                        if (found.matches.size == 1) {
+                            put("fingerprint", found.matches.first().fingerprint)
+                            put("requires_confirmation", found.matches.first().isSensitive)
+                        }
+                        put("data", untrustedData)
+                    }
+                )
+            }
+            "click_ui_element" -> {
+                val boundPkg = strArg(effectiveArgs, "_bound_package").ifBlank { strArg(effectiveArgs, "expected_package") }
+                val boundFingerprint = strArg(effectiveArgs, "_bound_fingerprint").ifBlank { strArg(effectiveArgs, "expected_fingerprint") }
+                val query = parseUiQuery(effectiveArgs).copy(
+                    expectedPackage = boundPkg,
+                    expectedFingerprint = boundFingerprint
+                )
+                val clicked = clickUiElementRaw(query)
+                val isOk = clicked.status == ScreenInteractionStatus.SUCCESS
+                ToolCallExecutionResult(
+                    toolName = "click_ui_element",
+                    ok = isOk,
+                    summary = clicked.message,
+                    payload = buildJsonObject {
+                        put("status", if (isOk) "ok" else "failed")
+                        put("result_code", clicked.status.name)
+                        put("trust", ScreenReaderEngine.UNTRUSTED_TRUST_LABEL)
+                        put("untrusted", true)
+                        if (clicked.packageName.isNotBlank()) put("package_name", clicked.packageName)
+                        if (clicked.fingerprint.isNotBlank()) put("fingerprint", clicked.fingerprint)
+                        put("clicked_via_ancestor", clicked.usedAncestor)
+                    }
+                )
+            }
+            "type_text" -> {
+                val boundPkg = strArg(effectiveArgs, "_bound_package").ifBlank { strArg(effectiveArgs, "expected_package") }
+                val boundFingerprint = strArg(effectiveArgs, "_bound_fingerprint").ifBlank { strArg(effectiveArgs, "expected_fingerprint") }
+                val query = parseTypeTextQuery(effectiveArgs).copy(
+                    expectedPackage = boundPkg,
+                    expectedFingerprint = boundFingerprint
+                )
+                val textToEnter = rawStrArg(effectiveArgs, "text")
+                val typed = typeTextRaw(query, textToEnter)
+                val isOk = typed.status == ScreenInteractionStatus.SUCCESS && typed.verified
+                ToolCallExecutionResult(
+                    toolName = "type_text",
+                    ok = isOk,
+                    summary = typed.message,
+                    payload = buildJsonObject {
+                        put("status", if (isOk) "ok" else "failed")
+                        put("result_code", typed.status.name)
+                        put("trust", ScreenReaderEngine.UNTRUSTED_TRUST_LABEL)
+                        put("untrusted", true)
+                        if (typed.packageName.isNotBlank()) put("package_name", typed.packageName)
+                        if (typed.fingerprint.isNotBlank()) put("fingerprint", typed.fingerprint)
+                        put("verified", typed.verified)
+                    }
+                )
+            }
+            "scroll_ui" -> {
+                val direction = strArg(effectiveArgs, "direction")
+                val query = parseUiQuery(effectiveArgs)
+                val scrolled = scrollContainerRaw(query, direction)
+                val isOk = scrolled.status == ScreenInteractionStatus.SUCCESS
+                ToolCallExecutionResult(
+                    toolName = "scroll_ui",
+                    ok = isOk,
+                    summary = scrolled.message,
+                    payload = buildJsonObject {
+                        put("status", if (isOk) "ok" else "failed")
+                        put("result_code", scrolled.status.name)
+                        put("trust", ScreenReaderEngine.UNTRUSTED_TRUST_LABEL)
+                        put("untrusted", true)
+                        if (scrolled.direction.isNotBlank()) put("direction", scrolled.direction)
+                        if (scrolled.packageName.isNotBlank()) put("package_name", scrolled.packageName)
+                        if (scrolled.fingerprint.isNotBlank()) put("fingerprint", scrolled.fingerprint)
+                    }
+                )
+            }
+            "execute_task_plan" -> {
+                val objective = strArg(effectiveArgs, "objective").ifBlank { "Multi-step UI task" }
+                val stepsElement = effectiveArgs["steps"] ?: effectiveArgs["steps_json"]
+                when (val validated = UiTaskPlanner.planFromJson(objective = objective, stepsElement = stepsElement, nowMs = nowMs())) {
+                    is TaskPlanValidationResult.Invalid -> {
+                        ToolCallExecutionResult(
+                            toolName = "execute_task_plan",
+                            ok = false,
+                            summary = validated.reason,
+                            payload = buildJsonObject {
+                                put("status", "failed")
+                                put("error_code", validated.errorCode.name)
+                            }
+                        )
+                    }
+                    is TaskPlanValidationResult.Valid -> {
+                        val report = uiTaskExecutionEngine.executePlan(validated.plan) { progress ->
+                            if (progress is TaskProgressEvent.SideEffect) {
+                                onSideEffect(progress.effect)
+                            }
+                        }
+                        if (report.status == TaskExecutionStatus.AWAITING_CONFIRMATION) {
+                            ToolCallExecutionResult(
+                                toolName = "execute_task_plan",
+                                ok = false,
+                                summary = report.summary,
+                                payload = buildJsonObject {
+                                    put("status", ToolConfirmationPolicy.STATUS_CONFIRMATION_REQUIRED)
+                                    put("requires_confirmation", true)
+                                    put("pending_id", report.pendingConfirmationId)
+                                    put("action", report.pendingConfirmationDescription)
+                                    put("task_status", report.status.name)
+                                    put("completed_steps", report.completedSteps.size)
+                                    put("skipped_steps", report.skippedSteps.size)
+                                }
+                            )
+                        } else {
+                            val isOk = report.status == TaskExecutionStatus.SUCCEEDED
+                            ToolCallExecutionResult(
+                                toolName = "execute_task_plan",
+                                ok = isOk,
+                                summary = report.summary,
+                                payload = buildJsonObject {
+                                    put("status", if (isOk) "ok" else "failed")
+                                    put("task_status", report.status.name)
+                                    put("completed_steps", report.completedSteps.size)
+                                    put("skipped_steps", report.skippedSteps.size)
+                                    put("corrections_used", report.correctionsUsed)
+                                    report.failedStep?.let { fs ->
+                                        put("failed_step_index", fs.stepIndex)
+                                        if (fs.resultCode.isNotBlank()) put("result_code", fs.resultCode)
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+            }
             "pc_task" -> {
                 val cfg = configStore.getBrainConfigOnce()
                 val goal = strArg(args, "goal")
@@ -576,7 +1111,15 @@ class ToolExecutor(
             else -> fail(toolName, "Unknown tool: $toolName")
         }
 
-        repository.logAction(result.toolName, result.summary, result.ok)
+        val auditSummary = if (result.toolName == "find_ui_element") {
+            val pkg = result.payload["package_name"]?.jsonPrimitive?.content.orEmpty()
+            val matches = result.payload["match_count"]?.jsonPrimitive?.content.orEmpty()
+            val code = result.payload["result_code"]?.jsonPrimitive?.content.orEmpty()
+            "Searched external UI ($pkg, matches=$matches, status=$code)"
+        } else {
+            result.summary
+        }
+        repository.logAction(result.toolName, auditSummary, result.ok)
         return result
     }
 

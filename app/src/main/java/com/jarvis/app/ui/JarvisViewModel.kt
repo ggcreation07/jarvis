@@ -4,6 +4,8 @@ import android.app.Application
 import android.graphics.Bitmap
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import com.jarvis.app.data.ai.KeyCheckStatus
 import com.jarvis.app.data.ai.ProviderModelsUiState
 import com.jarvis.app.data.ai.QuotaUsageSnapshot
@@ -80,6 +82,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     val providerModels: StateFlow<Map<String, ProviderModelsUiState>> get() = runtime.providerModels
     val quotaSnapshots: StateFlow<List<QuotaUsageSnapshot>> get() = runtime.quotaSnapshots
     val accessibilityEnabled: StateFlow<Boolean> get() = runtime.accessibilityEnabled
+    val accessibilityConnected: StateFlow<Boolean> get() = runtime.accessibilityConnected
     val notificationAccessEnabled: StateFlow<Boolean> get() = runtime.notificationAccessEnabled
     val qrResultBitmap: StateFlow<Bitmap?> get() = runtime.qrResultBitmap
     val clipboardPreview: StateFlow<String> get() = runtime.clipboardPreview
@@ -126,6 +129,10 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
 
     fun startAssistantListeningIfIdle(): Boolean =
         runtime.startAssistantListeningIfIdle(startForegroundServiceIfPermitted = true)
+
+    fun startInAppVoiceMode(): Boolean = runtime.startInAppVoiceMode()
+
+    fun interruptSpeechAndListen(): Boolean = runtime.interruptSpeechAndListen()
 
     fun hideVoiceOnlyUiKeepSession() = runtime.hideVoiceOnlyUiKeepSession()
 
@@ -239,4 +246,14 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     fun openAccessibilitySettings() = runtime.openAccessibilitySettings()
 
     fun openDefaultAssistantSettings() = runtime.openDefaultAssistantSettings()
+
+    companion object {
+        fun factory(application: Application): ViewModelProvider.Factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                    return JarvisViewModel(application) as T
+                }
+            }
+    }
 }

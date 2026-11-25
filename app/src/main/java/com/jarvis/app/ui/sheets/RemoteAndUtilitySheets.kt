@@ -332,6 +332,7 @@ fun DevicePowerSheet(
     val hud = LocalJarvisColors.current
     val telemetry by viewModel.telemetryState.collectAsStateWithLifecycle()
     val accessibilityEnabled by viewModel.accessibilityEnabled.collectAsStateWithLifecycle()
+    val accessibilityConnected by viewModel.accessibilityConnected.collectAsStateWithLifecycle()
 
     BackHandler(onBack = onClose)
 
@@ -430,10 +431,20 @@ fun DevicePowerSheet(
                             style = MaterialTheme.typography.bodyMedium,
                             color = hud.textSecondary
                         )
+                        val accessibilityStatusText = when {
+                            accessibilityConnected -> "Connected"
+                            accessibilityEnabled -> "Enabled but disconnected — reconnect in Accessibility Settings"
+                            else -> "Not granted"
+                        }
+                        val accessibilityStatusColor = when {
+                            accessibilityConnected -> hud.success
+                            accessibilityEnabled -> hud.warning
+                            else -> hud.danger
+                        }
                         Text(
-                            "Accessibility Phone Control: ${if (accessibilityEnabled) "Active" else "Off"}",
+                            "Accessibility Phone Control: $accessibilityStatusText",
                             style = MaterialTheme.typography.bodySmall,
-                            color = if (accessibilityEnabled) hud.success else hud.textSecondary
+                            color = accessibilityStatusColor
                         )
                     }
                 }

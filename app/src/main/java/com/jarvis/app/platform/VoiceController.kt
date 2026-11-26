@@ -20,7 +20,11 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
 import androidx.core.content.ContextCompat
+import com.jarvis.app.domain.brain.LanguageDetectionManager
+import com.jarvis.app.domain.brain.UserLanguage
+import com.jarvis.app.domain.model.BrainConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -195,6 +199,16 @@ class VoiceController(private val context: Context) {
 
     private val _voiceError = MutableStateFlow<String?>(null)
     val voiceError: StateFlow<String?> = _voiceError.asStateFlow()
+
+    val voiceSelectionManager = VoiceSelectionManager()
+    val languageDetectionManager = LanguageDetectionManager()
+
+    fun getAvailableMaleVoices(): List<AvailableVoiceInfo> =
+        voiceSelectionManager.getAvailableMaleVoices(tts)
+
+    fun setVoicesForTest(voices: Set<Voice>) {
+        voiceSelectionManager.voiceProviderOverride = { voices }
+    }
 
     private val ttsAudioFocusListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         when (focusChange) {
@@ -616,6 +630,15 @@ class VoiceController(private val context: Context) {
     fun isSpeechRecognitionAvailable(): Boolean =
         SpeechRecognizer.isRecognitionAvailable(context)
 
+    fun isOfflineSpeechRecognitionConfirmed(): Boolean {
+        if (!isSpeechRecognitionAvailable()) return false
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(context) }.getOrDefault(false)
+        } else {
+            false
+        }
+    }
+
     fun startListening(
         onFinalResult: (String) -> Unit,
         onFailure: (String) -> Unit,
@@ -636,7 +659,7 @@ class VoiceController(private val context: Context) {
             return
         }
         if (!isSpeechRecognitionAvailable()) {
-            val msg = "On-device speech recognition is unavailable on this device."
+            val msg = "Speech recognition is unavailable on this device."
             _voiceError.value = msg
             onFailure(msg)
             onRecognitionFailure?.invoke(
@@ -877,40 +900,49 @@ class VoiceController(private val context: Context) {
         destroyRecognizerSafely(cancelFirst = true)
     }
 
-    private fun configureTtsForText(text: String) {
-        val ttsInstance = tts ?: return
-        fun isLangAvailable(loc: Locale): Int =
-            runCatching { ttsInstance.isLanguageAvailable(loc) }.getOrDefault(TextToSpeech.LANG_NOT_SUPPORTED)
+    private fun configureTtsForText(
+        text: String,
+        detectedLanguage: UserLanguage? = null,
+        brainConfig: BrainConfig? = null
+    ): Boolean {
+        val ttsInstance = tts ?: return false
 
-        val hasDevanagari = text.any { it in '\u0900'..'\u097F' }
-        val locale = when {
-            hasDevanagari -> {
-                val mrLocale = Locale("mr", "IN")
-                val hiLocale = Locale("hi", "IN")
-                if (text.contains("आहे") || text.contains("माझे") || text.contains("काय")) {
-                    if (isLangAvailable(mrLocale) >= TextToSpeech.LANG_AVAILABLE) mrLocale else hiLocale
-                } else {
-                    if (isLangAvailable(hiLocale) >= TextToSpeech.LANG_AVAILABLE) hiLocale else mrLocale
+        val targetLanguage = detectedLanguage ?: languageDetectionManager.detect(
+            rawInput = text,
+            preferredLanguage = brainConfig?.preferredLanguage ?: "auto",
+            autoDetect = brainConfig?.autoLanguageDetectionEnabled ?: true
+        ).language
+
+        val outcome = voiceSelectionManager.selectMaleVoice(
+            tts = ttsInstance,
+            targetLanguage = targetLanguage,
+            preferredVoiceName = brainConfig?.selectedVoiceName.orEmpty(),
+            allowFallbackWithApproval = brainConfig?.allowVoiceFallbackWithApproval ?: false,
+            configuredElevenLabsMaleVoiceId = brainConfig?.elevenLabsVoiceId.orEmpty()
+        )
+
+        return when (outcome) {
+            is VoiceSelectionOutcome.Selected -> {
+                runCatching {
+                    ttsInstance.voice = outcome.voice
+                    ttsInstance.language = outcome.voice.locale
+                    ttsInstance.setSpeechRate(1.02f)
+                    ttsInstance.setPitch(1.0f)
                 }
+                true
             }
-            else -> {
-                val defaultLoc = Locale.getDefault()
-                val inLocale = Locale("en", "IN")
-                when {
-                    isLangAvailable(defaultLoc) >= TextToSpeech.LANG_AVAILABLE -> defaultLoc
-                    isLangAvailable(inLocale) >= TextToSpeech.LANG_AVAILABLE -> inLocale
-                    else -> defaultLoc
+            is VoiceSelectionOutcome.FallbackApproved -> {
+                runCatching {
+                    ttsInstance.language = outcome.locale
+                    ttsInstance.setSpeechRate(1.02f)
+                    ttsInstance.setPitch(outcome.pitch)
                 }
+                true
             }
-        }
-
-        val availability = isLangAvailable(locale)
-        val selectedLocale = if (availability >= TextToSpeech.LANG_AVAILABLE) locale else Locale("en", "IN")
-
-        runCatching {
-            ttsInstance.language = selectedLocale
-            ttsInstance.setSpeechRate(1.02f)
-            ttsInstance.setPitch(1.0f)
+            is VoiceSelectionOutcome.Unavailable -> {
+                _voiceError.value = outcome.reason
+                false
+            }
         }
     }
 
@@ -989,6 +1021,8 @@ class VoiceController(private val context: Context) {
     fun speak(
         text: String,
         enableBargeIn: Boolean = false,
+        detectedLanguage: UserLanguage? = null,
+        brainConfig: BrainConfig? = null,
         onBargeInDetected: (() -> Unit)? = null
     ): Boolean {
         if (text.isBlank()) return false
@@ -1006,6 +1040,10 @@ class VoiceController(private val context: Context) {
         }
         stopBargeInMonitor()
 
+        if (!configureTtsForText(clean, detectedLanguage, brainConfig)) {
+            return false
+        }
+
         val baseId = UUID.randomUUID().toString()
         val finalUtteranceId = if (chunks.size == 1) baseId else "${baseId}_final"
         utteranceInterruptedOrStopped = false
@@ -1014,7 +1052,6 @@ class VoiceController(private val context: Context) {
         lastStartedUtteranceId = finalUtteranceId
         pendingBargeInCallback = if (enableBargeIn) onBargeInDetected else null
 
-        configureTtsForText(clean)
         requestTtsAudioFocus()
 
         val params = if (ttsAudioSessionId > 0) {

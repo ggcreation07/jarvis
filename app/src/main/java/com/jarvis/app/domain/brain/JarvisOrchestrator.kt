@@ -15,6 +15,7 @@ import com.jarvis.app.domain.model.FIREBASE_AI_MODELS
 import com.jarvis.app.domain.model.JARVIS_AGENTS
 import com.jarvis.app.domain.model.TaskRecordItem
 import com.jarvis.app.domain.model.ToolActivityItem
+import com.jarvis.app.platform.DeviceCapabilityRegistry
 import com.jarvis.app.platform.ScreenReadResult
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
@@ -43,8 +44,12 @@ class JarvisOrchestrator(
     private val secretStore: SecureSecretStore,
     private val firebaseAiService: FirebaseAiService,
     private val byoAiClient: ByoAiClient,
-    private val toolExecutor: ToolExecutor
+    private val toolExecutor: ToolExecutor,
+    private val capabilityRegistry: DeviceCapabilityRegistry? = null,
+    private val isFirebaseAiAvailable: () -> Boolean = { firebaseAiService.isAvailable() }
 ) {
+    private val localEngine = LocalDeviceCommandEngine(toolExecutor, capabilityRegistry)
+    private val followUpEngine = LocalFollowUpEngine(toolExecutor, capabilityRegistry)
 
     fun parseAgentMention(rawText: String, fallbackAgentId: String): Pair<String, String> {
         val trimmed = rawText.trim()
@@ -67,6 +72,7 @@ class JarvisOrchestrator(
         isVoiceTurn: Boolean = false
     ): Flow<TurnProgressEvent> = channelFlow {
         val (agentId, cleanInput) = parseAgentMention(rawUserInput, brainConfig.selectedAgentId)
+        val safeObjective = TaskContextSanitizer.sanitizeSummaryText(cleanInput).take(120)
         send(TurnProgressEvent.AgentSelected(agentId))
 
         val taskId = "task_${System.currentTimeMillis()}"
@@ -74,7 +80,7 @@ class JarvisOrchestrator(
         repository.upsertTaskRecord(
             TaskRecordItem(
                 id = taskId,
-                objective = cleanInput.take(120),
+                objective = safeObjective,
                 state = "running",
                 agentId = agentId,
                 stepsCount = 0,
@@ -92,29 +98,33 @@ class JarvisOrchestrator(
                 }
             ) {
                 is ConfirmationTurnOutcome.Cancelled -> {
+                    toolExecutor.localDeviceTaskExecutor.clearPendingContinuation()
                     toolExecutor.uiTaskExecutionEngine.clearPendingContinuation()
+                    toolExecutor.conversationContextManager.syncTaskAndConfirmation(toolExecutor.taskContextStore, null)
                     repository.upsertTaskRecord(
-                        TaskRecordItem(taskId, cleanInput.take(120), "cancelled", agentId, 0, confOutcome.replyText.take(160))
+                        TaskRecordItem(taskId, safeObjective, "cancelled", agentId, 0, confOutcome.replyText.take(160))
                     )
                     send(TurnProgressEvent.Finished(confOutcome.replyText, agentId, emptyList(), isError = false))
                     return@channelFlow
                 }
                 is ConfirmationTurnOutcome.Expired -> {
+                    toolExecutor.localDeviceTaskExecutor.clearPendingContinuation()
                     toolExecutor.uiTaskExecutionEngine.clearPendingContinuation()
                     repository.upsertTaskRecord(
-                        TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, confOutcome.replyText.take(160))
+                        TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, confOutcome.replyText.take(160))
                     )
                     send(TurnProgressEvent.Finished(confOutcome.replyText, agentId, emptyList(), isError = false))
                     return@channelFlow
                 }
                 is ConfirmationTurnOutcome.NeedsClarification -> {
                     repository.upsertTaskRecord(
-                        TaskRecordItem(taskId, cleanInput.take(120), "awaiting_confirmation", agentId, 0, confOutcome.replyText.take(160))
+                        TaskRecordItem(taskId, safeObjective, "awaiting_confirmation", agentId, 0, confOutcome.replyText.take(160))
                     )
                     send(TurnProgressEvent.Finished(confOutcome.replyText, agentId, emptyList(), isError = false))
                     return@channelFlow
                 }
                 is ConfirmationTurnOutcome.Executed -> {
+                    toolExecutor.conversationContextManager.clearPendingClarification()
                     val res = confOutcome.result
                     val toolName = confOutcome.pending.binding.toolName
                     val act = ToolActivityItem(
@@ -127,7 +137,7 @@ class JarvisOrchestrator(
                     activities.add(act)
                     send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
 
-                    val resumedReport = toolExecutor.uiTaskExecutionEngine.resumeIfPending(
+                    val resumedReport = toolExecutor.resumePendingTaskAfterConfirmation(
                         pendingConfirmationId = confOutcome.pending.id,
                         confirmedResult = res
                     ) { progress ->
@@ -185,7 +195,7 @@ class JarvisOrchestrator(
                         repository.upsertTaskRecord(
                             TaskRecordItem(
                                 id = taskId,
-                                objective = cleanInput.take(120),
+                                objective = safeObjective,
                                 state = finalState,
                                 agentId = agentId,
                                 stepsCount = resumedReport.completedSteps.size.coerceAtLeast(1),
@@ -199,7 +209,7 @@ class JarvisOrchestrator(
                     repository.upsertTaskRecord(
                         TaskRecordItem(
                             id = taskId,
-                            objective = cleanInput.take(120),
+                            objective = safeObjective,
                             state = if (res.ok) "succeeded" else "suspended",
                             agentId = agentId,
                             stepsCount = 1,
@@ -222,14 +232,14 @@ class JarvisOrchestrator(
                         toolExecutor.cancelActiveUiTask()
                         val reply = "Active task '${active.originalRequest}' has been cancelled."
                         repository.upsertTaskRecord(
-                            TaskRecordItem(taskId, cleanInput.take(120), "cancelled", agentId, active.completedSteps.size, reply)
+                            TaskRecordItem(taskId, safeObjective, "cancelled", agentId, active.completedSteps.size, reply)
                         )
                         send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                         return@channelFlow
                     } else {
                         val reply = "No active task to cancel."
                         repository.upsertTaskRecord(
-                            TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, reply)
+                            TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, reply)
                         )
                         send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                         return@channelFlow
@@ -242,21 +252,21 @@ class JarvisOrchestrator(
                             toolExecutor.pauseActiveUiTask()
                             val reply = "Task paused at step ${active.currentStep?.index ?: 1}. Say 'continue' or 'next step karo' to resume."
                             repository.upsertTaskRecord(
-                                TaskRecordItem(taskId, cleanInput.take(120), "paused", agentId, active.completedSteps.size, reply)
+                                TaskRecordItem(taskId, safeObjective, "paused", agentId, active.completedSteps.size, reply)
                             )
                             send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                             return@channelFlow
                         } else if (active.state == TaskLifecycleState.PAUSED) {
                             val reply = "Task is already paused at step ${active.remainingSteps.firstOrNull()?.index ?: 1}."
                             repository.upsertTaskRecord(
-                                TaskRecordItem(taskId, cleanInput.take(120), "paused", agentId, active.completedSteps.size, reply)
+                                TaskRecordItem(taskId, safeObjective, "paused", agentId, active.completedSteps.size, reply)
                             )
                             send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                             return@channelFlow
                         } else {
                             val reply = "Cannot pause task in state ${active.state}."
                             repository.upsertTaskRecord(
-                                TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, active.completedSteps.size, reply)
+                                TaskRecordItem(taskId, safeObjective, "suspended", agentId, active.completedSteps.size, reply)
                             )
                             send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                             return@channelFlow
@@ -264,7 +274,7 @@ class JarvisOrchestrator(
                     } else {
                         val reply = "No active task to pause."
                         repository.upsertTaskRecord(
-                            TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, reply)
+                            TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, reply)
                         )
                         send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                         return@channelFlow
@@ -275,25 +285,26 @@ class JarvisOrchestrator(
                     if (active == null) {
                         val reply = "No active task to continue."
                         repository.upsertTaskRecord(
-                            TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, reply)
+                            TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, reply)
                         )
                         send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                         return@channelFlow
                     } else if (active.state == TaskLifecycleState.AWAITING_CONFIRMATION) {
                         val reply = "Confirmation required: ${active.pendingConfirmationDescription ?: "Sensitive action"}. Please say 'yes' or 'confirm' to proceed, or 'cancel' to abort."
                         repository.upsertTaskRecord(
-                            TaskRecordItem(taskId, cleanInput.take(120), "awaiting_confirmation", agentId, active.completedSteps.size, reply)
+                            TaskRecordItem(taskId, safeObjective, "awaiting_confirmation", agentId, active.completedSteps.size, reply)
                         )
                         send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                         return@channelFlow
                     } else if (active.state == TaskLifecycleState.RUNNING) {
                         val reply = "Task is already executing step ${active.currentStep?.index ?: 1} (${active.currentStep?.description ?: "in progress"})."
                         repository.upsertTaskRecord(
-                            TaskRecordItem(taskId, cleanInput.take(120), "running", agentId, active.completedSteps.size, reply)
+                            TaskRecordItem(taskId, safeObjective, "running", agentId, active.completedSteps.size, reply)
                         )
                         send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                         return@channelFlow
                     } else if (active.state == TaskLifecycleState.PAUSED) {
+                        capabilityRegistry?.refresh()
                         val report = toolExecutor.resumeActiveUiTask { progress ->
                             when (progress) {
                                 is TaskProgressEvent.Announced -> {
@@ -349,7 +360,7 @@ class JarvisOrchestrator(
                         repository.upsertTaskRecord(
                             TaskRecordItem(
                                 id = taskId,
-                                objective = cleanInput.take(120),
+                                objective = safeObjective,
                                 state = finalState,
                                 agentId = agentId,
                                 stepsCount = report.completedSteps.size.coerceAtLeast(1),
@@ -361,7 +372,7 @@ class JarvisOrchestrator(
                     } else {
                         val reply = "Cannot continue task in state ${active.state}."
                         repository.upsertTaskRecord(
-                            TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, active.completedSteps.size, reply)
+                            TaskRecordItem(taskId, safeObjective, "suspended", agentId, active.completedSteps.size, reply)
                         )
                         send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                         return@channelFlow
@@ -391,7 +402,7 @@ class JarvisOrchestrator(
                         "No previous task step to check."
                     }
                     repository.upsertTaskRecord(
-                        TaskRecordItem(taskId, cleanInput.take(120), "succeeded", agentId, 1, reply.take(160))
+                        TaskRecordItem(taskId, safeObjective, "succeeded", agentId, 1, reply.take(160))
                     )
                     send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                     return@channelFlow
@@ -400,126 +411,308 @@ class JarvisOrchestrator(
             }
         }
 
-        // 1. Fast deterministic local match when there is no image attached
+        // 0C. Context-Aware Local Intelligence Engine (Phase 6C: Hindi/Marathi/English/Hinglish follow-ups without AI key)
         if (attachedBitmap == null) {
-            val direct = DirectCommandMatcher.match(cleanInput)
-            if (direct is DirectActionMatch.ToolCall) {
-                val actId = "act_${System.currentTimeMillis()}"
-                activities.add(ToolActivityItem(actId, direct.toolName, direct.toolName.replace("_", " "), "running"))
-                send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
-                val jsonArgs = direct.args.mapValues { JsonPrimitive(it.value) }
-                val res = toolExecutor.execute(direct.toolName, jsonArgs) { effect ->
+            when (
+                val ctxOutcome = followUpEngine.tryHandle(cleanInput) { effect ->
                     send(TurnProgressEvent.SideEffect(effect))
                 }
-                val awaitingConfirmation = res.isConfirmationRequired()
+            ) {
+                is LocalFollowUpOutcome.Clarification -> {
+                    repository.upsertTaskRecord(
+                        TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, ctxOutcome.question.take(160))
+                    )
+                    send(TurnProgressEvent.Finished(ctxOutcome.question, agentId, emptyList(), isError = false))
+                    return@channelFlow
+                }
+                is LocalFollowUpOutcome.Executed -> {
+                    val act = ToolActivityItem(
+                        id = "act_${System.currentTimeMillis()}",
+                        toolName = ctxOutcome.toolName,
+                        label = ctxOutcome.toolName.replace("_", " "),
+                        status = when {
+                            ctxOutcome.ok -> "succeeded"
+                            ctxOutcome.awaitingConfirmation -> "awaiting_confirmation"
+                            else -> "failed"
+                        },
+                        summary = ctxOutcome.summary
+                    )
+                    activities.add(act)
+                    send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
+                    toolExecutor.conversationContextManager.syncTaskAndConfirmation(
+                        toolExecutor.taskContextStore,
+                        toolExecutor.getPendingConfirmation()
+                    )
+                    repository.upsertTaskRecord(
+                        TaskRecordItem(
+                            id = taskId,
+                            objective = safeObjective,
+                            state = when {
+                                ctxOutcome.ok -> "succeeded"
+                                ctxOutcome.awaitingConfirmation -> "awaiting_confirmation"
+                                else -> "suspended"
+                            },
+                            agentId = agentId,
+                            stepsCount = 1,
+                            summary = ctxOutcome.summary.take(160)
+                        )
+                    )
+                    send(
+                        TurnProgressEvent.Finished(
+                            replyText = ctxOutcome.summary,
+                            agentId = agentId,
+                            activities = activities.toList(),
+                            isError = !ctxOutcome.ok && !ctxOutcome.awaitingConfirmation
+                        )
+                    )
+                    return@channelFlow
+                }
+                LocalFollowUpOutcome.NotApplicable -> Unit
+            }
+        }
+
+        // 1. Fast deterministic local routing & multi-step local automation when no image is attached (no AI API key needed)
+        if (attachedBitmap == null) {
+            val localPlanner = LocalDeviceTaskPlanner(
+                capabilityRegistry = capabilityRegistry,
+                appResolver = { toolExecutor.localDeviceController.resolveApplication(it) }
+            )
+            val localPlanResult = localPlanner.planFromUserRequest(cleanInput, id = taskId)
+            when (localPlanResult) {
+                is LocalTaskPlanResult.ClarificationNeeded -> {
+                    repository.upsertTaskRecord(
+                        TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, localPlanResult.question.take(160))
+                    )
+                    send(TurnProgressEvent.Finished(localPlanResult.question, agentId, emptyList(), isError = false))
+                    return@channelFlow
+                }
+                is LocalTaskPlanResult.CapabilityBlocked -> {
+                    repository.upsertTaskRecord(
+                        TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, localPlanResult.reason.take(160))
+                    )
+                    send(TurnProgressEvent.Finished(localPlanResult.reason, agentId, emptyList(), isError = true))
+                    return@channelFlow
+                }
+                is LocalTaskPlanResult.Rejected -> {
+                    repository.upsertTaskRecord(
+                        TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, localPlanResult.reason.take(160))
+                    )
+                    send(TurnProgressEvent.Finished(localPlanResult.reason, agentId, emptyList(), isError = true))
+                    return@channelFlow
+                }
+                is LocalTaskPlanResult.Planned,
+                LocalTaskPlanResult.NotApplicable -> Unit
+            }
+
+            val uiPlanned = UiTaskPlanner.planFromUserRequest(cleanInput, id = taskId)
+            val useLocalExecutorOverUiEngine = localPlanResult is LocalTaskPlanResult.Planned && (
+                uiPlanned !is NaturalPlanParseResult.Planned ||
+                    localPlanResult.plan.steps.any {
+                        it.action !in setOf(
+                            LocalTaskAction.OPEN_APP,
+                            LocalTaskAction.READ_SCREEN,
+                            LocalTaskAction.FIND_UI_ELEMENT,
+                            LocalTaskAction.CLICK_UI_ELEMENT,
+                            LocalTaskAction.TYPE_TEXT,
+                            LocalTaskAction.SCROLL_UI
+                        )
+                    } ||
+                    uiPlanned.plan.steps.any { st ->
+                        val targetText = (st.args["text"] as? JsonPrimitive)?.content?.lowercase(Locale.ROOT).orEmpty()
+                        st.action == PlannedTaskAction.CLICK_UI_ELEMENT &&
+                            targetText in setOf("it", "that", "this", "that element")
+                    }
+                )
+
+            if (uiPlanned is NaturalPlanParseResult.Rejected) {
+                repository.upsertTaskRecord(
+                    TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, uiPlanned.reason.take(160))
+                )
+                send(TurnProgressEvent.Finished(uiPlanned.reason, agentId, emptyList(), isError = true))
+                return@channelFlow
+            }
+
+            if (localPlanResult is LocalTaskPlanResult.Planned && useLocalExecutorOverUiEngine) {
+                val report = toolExecutor.localDeviceTaskExecutor.executePlan(localPlanResult.plan) { progress ->
+                    when (progress) {
+                        is TaskProgressEvent.Announced -> send(TurnProgressEvent.StreamingText(progress.message))
+                        is TaskProgressEvent.StepStarted -> {
+                            activities.add(
+                                ToolActivityItem(
+                                    id = "step_${progress.stepIndex}_${activities.size}",
+                                    toolName = progress.step.action.toolName,
+                                    label = progress.step.description,
+                                    status = "running"
+                                )
+                            )
+                            send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
+                            send(TurnProgressEvent.StreamingText(progress.message))
+                        }
+                        is TaskProgressEvent.StepFinished -> {
+                            val idx = activities.indexOfLast { it.status == "running" }
+                            if (idx >= 0) {
+                                activities[idx] = activities[idx].copy(
+                                    status = when (progress.outcome.status) {
+                                        TaskStepStatus.COMPLETED -> "succeeded"
+                                        TaskStepStatus.AWAITING_CONFIRMATION -> "awaiting_confirmation"
+                                        else -> "failed"
+                                    },
+                                    summary = progress.outcome.message
+                                )
+                                send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
+                            }
+                        }
+                        is TaskProgressEvent.CorrectionApplied -> {
+                            send(TurnProgressEvent.StreamingText("Recovering locally (${progress.correctionNumber}/${progress.maxCorrections}): ${progress.replacementStep.description}…"))
+                        }
+                        is TaskProgressEvent.SideEffect -> send(TurnProgressEvent.SideEffect(progress.effect))
+                    }
+                }
+                val finalState = when (report.status) {
+                    TaskExecutionStatus.SUCCEEDED -> "succeeded"
+                    TaskExecutionStatus.AWAITING_CONFIRMATION -> "awaiting_confirmation"
+                    TaskExecutionStatus.CANCELLED -> "cancelled"
+                    TaskExecutionStatus.PAUSED -> "paused"
+                    else -> "suspended"
+                }
+                val isError = report.status !in setOf(
+                    TaskExecutionStatus.SUCCEEDED,
+                    TaskExecutionStatus.AWAITING_CONFIRMATION,
+                    TaskExecutionStatus.CANCELLED,
+                    TaskExecutionStatus.PAUSED
+                )
+                toolExecutor.conversationContextManager.syncTaskAndConfirmation(
+                    toolExecutor.taskContextStore,
+                    toolExecutor.getPendingConfirmation()
+                )
+                repository.upsertTaskRecord(
+                    TaskRecordItem(
+                        id = taskId,
+                        objective = safeObjective,
+                        state = finalState,
+                        agentId = agentId,
+                        stepsCount = report.completedSteps.size.coerceAtLeast(1),
+                        summary = report.summary.take(160)
+                    )
+                )
+                send(TurnProgressEvent.Finished(report.summary, agentId, activities.toList(), isError = isError))
+                return@channelFlow
+            }
+
+            if (uiPlanned is NaturalPlanParseResult.Planned) {
+                val report = toolExecutor.uiTaskExecutionEngine.executePlan(uiPlanned.plan) { progress ->
+                    when (progress) {
+                        is TaskProgressEvent.Announced -> {
+                            send(TurnProgressEvent.StreamingText(progress.message))
+                        }
+                        is TaskProgressEvent.StepStarted -> {
+                            activities.add(
+                                ToolActivityItem(
+                                    id = "step_${progress.stepIndex}_${activities.size}",
+                                    toolName = progress.step.action.toolName,
+                                    label = progress.step.description,
+                                    status = "running"
+                                )
+                            )
+                            send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
+                            send(TurnProgressEvent.StreamingText(progress.message))
+                        }
+                        is TaskProgressEvent.StepFinished -> {
+                            val idx = activities.indexOfLast { it.status == "running" }
+                            if (idx >= 0) {
+                                activities[idx] = activities[idx].copy(
+                                    status = when (progress.outcome.status) {
+                                        TaskStepStatus.COMPLETED -> "succeeded"
+                                        TaskStepStatus.AWAITING_CONFIRMATION -> "awaiting_confirmation"
+                                        else -> "failed"
+                                    },
+                                    summary = progress.outcome.message
+                                )
+                                send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
+                            }
+                        }
+                        is TaskProgressEvent.CorrectionApplied -> {
+                            send(TurnProgressEvent.StreamingText("Adjusting plan (${progress.correctionNumber}/${progress.maxCorrections}): ${progress.replacementStep.description}…"))
+                        }
+                        is TaskProgressEvent.SideEffect -> {
+                            send(TurnProgressEvent.SideEffect(progress.effect))
+                        }
+                    }
+                }
+                val finalState = when (report.status) {
+                    TaskExecutionStatus.SUCCEEDED -> "succeeded"
+                    TaskExecutionStatus.AWAITING_CONFIRMATION -> "awaiting_confirmation"
+                    TaskExecutionStatus.CANCELLED -> "cancelled"
+                    else -> "suspended"
+                }
+                val isError = report.status !in setOf(
+                    TaskExecutionStatus.SUCCEEDED,
+                    TaskExecutionStatus.AWAITING_CONFIRMATION,
+                    TaskExecutionStatus.CANCELLED
+                )
+                toolExecutor.conversationContextManager.syncTaskAndConfirmation(
+                    toolExecutor.taskContextStore,
+                    toolExecutor.getPendingConfirmation()
+                )
+                repository.upsertTaskRecord(
+                    TaskRecordItem(
+                        id = taskId,
+                        objective = safeObjective,
+                        state = finalState,
+                        agentId = agentId,
+                        stepsCount = report.completedSteps.size.coerceAtLeast(1),
+                        summary = report.summary.take(160)
+                    )
+                )
+                send(TurnProgressEvent.Finished(report.summary, agentId, activities.toList(), isError = isError))
+                return@channelFlow
+            }
+
+            // 1B. Single-step fast local command match (Phase 6A)
+            val localMatch = localEngine.match(cleanInput)
+            if (localMatch != null) {
+                val actName = when (localMatch) {
+                    is LocalCommandMatch.ToolCommand -> localMatch.toolName
+                    is LocalCommandMatch.RestrictedAction -> "device_control"
+                }
+                val actId = "act_${System.currentTimeMillis()}"
+                activities.add(ToolActivityItem(actId, actName, actName.replace("_", " "), "running"))
+                send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
+                val execRes = localEngine.executeMatch(localMatch) { effect ->
+                    send(TurnProgressEvent.SideEffect(effect))
+                }
                 activities[0] = activities[0].copy(
                     status = when {
-                        res.ok -> "succeeded"
-                        awaitingConfirmation -> "awaiting_confirmation"
+                        execRes.ok -> "succeeded"
+                        execRes.awaitingConfirmation -> "awaiting_confirmation"
                         else -> "failed"
                     },
-                    summary = res.summary
+                    summary = execRes.summary
                 )
                 send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
                 repository.upsertTaskRecord(
                     TaskRecordItem(
                         id = taskId,
-                        objective = cleanInput.take(120),
+                        objective = safeObjective,
                         state = when {
-                            res.ok -> "succeeded"
-                            awaitingConfirmation -> "awaiting_confirmation"
+                            execRes.ok -> "succeeded"
+                            execRes.awaitingConfirmation -> "awaiting_confirmation"
                             else -> "suspended"
                         },
                         agentId = agentId,
                         stepsCount = 1,
-                        summary = res.summary
+                        summary = execRes.summary
                     )
                 )
                 send(
                     TurnProgressEvent.Finished(
-                        replyText = res.summary,
+                        replyText = execRes.summary,
                         agentId = agentId,
                         activities = activities.toList(),
-                        isError = !res.ok && !awaitingConfirmation
+                        isError = !execRes.ok && !execRes.awaitingConfirmation
                     )
                 )
                 return@channelFlow
-            }
-
-            // 1B. Deterministic multi-step UI Task Planner (Phase 4A) when all clauses map to verified UI actions
-            when (val planned = UiTaskPlanner.planFromUserRequest(cleanInput, id = taskId)) {
-                is NaturalPlanParseResult.Rejected -> {
-                    repository.upsertTaskRecord(
-                        TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, planned.reason.take(160))
-                    )
-                    send(TurnProgressEvent.Finished(planned.reason, agentId, emptyList(), isError = true))
-                    return@channelFlow
-                }
-                is NaturalPlanParseResult.Planned -> {
-                    val report = toolExecutor.uiTaskExecutionEngine.executePlan(planned.plan) { progress ->
-                        when (progress) {
-                            is TaskProgressEvent.Announced -> {
-                                send(TurnProgressEvent.StreamingText(progress.message))
-                            }
-                            is TaskProgressEvent.StepStarted -> {
-                                activities.add(
-                                    ToolActivityItem(
-                                        id = "step_${progress.stepIndex}_${activities.size}",
-                                        toolName = progress.step.action.toolName,
-                                        label = progress.step.description,
-                                        status = "running"
-                                    )
-                                )
-                                send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
-                                send(TurnProgressEvent.StreamingText(progress.message))
-                            }
-                            is TaskProgressEvent.StepFinished -> {
-                                val idx = activities.indexOfLast { it.status == "running" }
-                                if (idx >= 0) {
-                                    activities[idx] = activities[idx].copy(
-                                        status = when (progress.outcome.status) {
-                                            TaskStepStatus.COMPLETED -> "succeeded"
-                                            TaskStepStatus.AWAITING_CONFIRMATION -> "awaiting_confirmation"
-                                            else -> "failed"
-                                        },
-                                        summary = progress.outcome.message
-                                    )
-                                    send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
-                                }
-                            }
-                            is TaskProgressEvent.CorrectionApplied -> {
-                                send(TurnProgressEvent.StreamingText("Adjusting plan (${progress.correctionNumber}/${progress.maxCorrections}): ${progress.replacementStep.description}…"))
-                            }
-                            is TaskProgressEvent.SideEffect -> {
-                                send(TurnProgressEvent.SideEffect(progress.effect))
-                            }
-                        }
-                    }
-                    val finalState = when (report.status) {
-                        TaskExecutionStatus.SUCCEEDED -> "succeeded"
-                        TaskExecutionStatus.AWAITING_CONFIRMATION -> "awaiting_confirmation"
-                        TaskExecutionStatus.CANCELLED -> "cancelled"
-                        else -> "suspended"
-                    }
-                    val isError = report.status !in setOf(
-                        TaskExecutionStatus.SUCCEEDED,
-                        TaskExecutionStatus.AWAITING_CONFIRMATION,
-                        TaskExecutionStatus.CANCELLED
-                    )
-                    repository.upsertTaskRecord(
-                        TaskRecordItem(
-                            id = taskId,
-                            objective = cleanInput.take(120),
-                            state = finalState,
-                            agentId = agentId,
-                            stepsCount = report.completedSteps.size.coerceAtLeast(1),
-                            summary = report.summary.take(160)
-                        )
-                    )
-                    send(TurnProgressEvent.Finished(report.summary, agentId, activities.toList(), isError = isError))
-                    return@channelFlow
-                }
-                NaturalPlanParseResult.NotApplicable -> Unit
             }
         }
 
@@ -538,7 +731,7 @@ class JarvisOrchestrator(
         if (provider !in setOf("auto", "firebase_ai")) {
             if (provider !in BYO_LLM_PROVIDER_IDS) {
                 val msg = "Unsupported provider '$provider'. Select a valid provider in Settings -> Intelligence & Model Routing."
-                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+                repository.upsertTaskRecord(TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, msg))
                 send(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
                 return@channelFlow
             }
@@ -555,28 +748,28 @@ class JarvisOrchestrator(
             }
             val userKey = if (keyName.isNotBlank()) secretStore.getSecret(keyName) else ""
             if (userKey.isBlank()) {
-                val msg = "No API key saved for $provider yet. Add one in Settings -> API Keys, or switch Intelligence back to Auto / Firebase AI."
-                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+                val msg = "No API key saved for $provider yet. Add one in Settings -> API Keys, or switch Intelligence back to Auto / Firebase AI. Local device controls still work without an API key."
+                repository.upsertTaskRecord(TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, msg.take(160)))
                 send(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
                 return@channelFlow
             }
             if (attachedBitmap != null) {
                 val msg = "Image attachments require Auto / Firebase AI Logic (built-in). Switch provider or remove the image attachment."
-                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+                repository.upsertTaskRecord(TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, msg))
                 send(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
                 return@channelFlow
             }
             val selectedModel = brainConfig.activeModel.trim()
             if (selectedModel.isEmpty()) {
                 val msg = "No model selected for $provider. Open Settings -> Intelligence & Model Routing to fetch and select a model."
-                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+                repository.upsertTaskRecord(TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, msg))
                 send(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
                 return@channelFlow
             }
             val cached = configStore.loadProviderModelsCache(provider)
             if (cached != null && cached.models.isNotEmpty() && cached.models.none { it.id == selectedModel }) {
                 val msg = "Selected model '$selectedModel' is unavailable for $provider. Please open Settings and select another model."
-                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+                repository.upsertTaskRecord(TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, msg))
                 send(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
                 return@channelFlow
             }
@@ -606,7 +799,7 @@ class JarvisOrchestrator(
                         completed.ifBlank { "No text returned." }
                     }
                 }
-                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "succeeded", agentId, 1, reply.take(160)))
+                repository.upsertTaskRecord(TaskRecordItem(taskId, safeObjective, "succeeded", agentId, 1, reply.take(160)))
                 send(TurnProgressEvent.Finished(reply, agentId, emptyList(), isError = false))
                 return@channelFlow
             } catch (e: CancellationException) {
@@ -614,7 +807,7 @@ class JarvisOrchestrator(
             } catch (e: Exception) {
                 val rawErr = e.localizedMessage ?: "$provider request failed."
                 val errMsg = byoAiClient.sanitizeSecret(rawErr, userKey)
-                repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, errMsg))
+                repository.upsertTaskRecord(TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, errMsg))
                 send(TurnProgressEvent.Finished(errMsg, agentId, emptyList(), isError = true))
                 return@channelFlow
             }
@@ -623,7 +816,15 @@ class JarvisOrchestrator(
         // 4. Default & Primary: Built-in Firebase AI Logic with tool calling + streaming
         if (brainConfig.activeModel !in FIREBASE_AI_MODELS) {
             val msg = "Model '${brainConfig.activeModel}' is not available on built-in Firebase AI Logic. Select a Firebase AI model in Settings."
-            repository.upsertTaskRecord(TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, 0, msg))
+            repository.upsertTaskRecord(TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, msg))
+            send(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
+            return@channelFlow
+        }
+        if (!isFirebaseAiAvailable()) {
+            val msg = "This request requires an AI provider, and no AI provider is configured or available right now. " +
+                "Local phone controls (volume, flashlight, apps, navigation, screen reading, and Settings) work offline without any API key, " +
+                "or you can add an API key in Settings -> API Keys."
+            repository.upsertTaskRecord(TaskRecordItem(taskId, safeObjective, "suspended", agentId, 0, msg.take(160)))
             send(TurnProgressEvent.Finished(msg, agentId, emptyList(), isError = true))
             return@channelFlow
         }
@@ -691,7 +892,7 @@ class JarvisOrchestrator(
             repository.upsertTaskRecord(
                 TaskRecordItem(
                     id = taskId,
-                    objective = cleanInput.take(120),
+                    objective = safeObjective,
                     state = finalState,
                     agentId = agentId,
                     stepsCount = activities.size.coerceAtLeast(1),
@@ -701,13 +902,13 @@ class JarvisOrchestrator(
             send(TurnProgressEvent.Finished(finalReply, agentId, activities.toList(), isError = false))
         } catch (e: CancellationException) {
             repository.upsertTaskRecord(
-                TaskRecordItem(taskId, cleanInput.take(120), "cancelled", agentId, activities.size, "Stopped.")
+                TaskRecordItem(taskId, safeObjective, "cancelled", agentId, activities.size, "Stopped.")
             )
             throw e
         } catch (e: Exception) {
             val errMsg = e.localizedMessage ?: "Couldn't reach Firebase AI right now."
             repository.upsertTaskRecord(
-                TaskRecordItem(taskId, cleanInput.take(120), "suspended", agentId, activities.size, errMsg)
+                TaskRecordItem(taskId, safeObjective, "suspended", agentId, activities.size, errMsg)
             )
             send(TurnProgressEvent.Finished(errMsg, agentId, activities.toList(), isError = true))
         }

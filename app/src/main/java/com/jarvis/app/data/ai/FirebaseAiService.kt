@@ -44,6 +44,15 @@ open class FirebaseAiService {
         private const val MAX_TOOL_ROUNDS = 4
     }
 
+    open fun isAvailable(): Boolean = runCatching {
+        val app = com.google.firebase.FirebaseApp.getInstance()
+        val opts = app.options
+        opts.apiKey.isNotBlank() &&
+            opts.applicationId.isNotBlank() &&
+            !opts.projectId.isNullOrBlank() &&
+            opts.projectId != "remixed-project-id"
+    }.getOrDefault(false)
+
     private val imageModel by lazy {
         Firebase.ai.generativeModel(
             modelName = "gemini-nano-banana-2.1",

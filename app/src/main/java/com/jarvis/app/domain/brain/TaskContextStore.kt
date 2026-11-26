@@ -124,6 +124,14 @@ object TaskContextSanitizer {
         return text
             .replace(Regex("(?i)(password|passwd|pwd|passcode|pin|mpin|otp|totp|cvv|cvc)\\s*[:=]\\s*\\S+"), "$1=[REDACTED]")
             .replace(Regex("(?i)\\b(otp|pin|cvv|passcode)\\s+(\\d{3,8})\\b"), "$1 [REDACTED]")
+            .replace(
+                Regex("(?i)\\b(type|enter|write|input)\\s+([\"'])([^\"']+)\\2(\\s+(?:in|into|on)\\s+(?:the\\s+)?[^,;.]*?(?:password|passwd|pwd|passcode|secret|otp|totp|2fa|pin|mpin|cvv|cvc)[^,;.]*)"),
+                "$1 [REDACTED]$4"
+            )
+            .replace(
+                Regex("(?i)\\b(type|enter|write|input)\\s+(\\S+)(\\s+(?:in|into)\\s+(?:the\\s+)?[^,;.]*?(?:password|passwd|pwd|passcode|secret|otp|totp|2fa|pin|mpin|cvv|cvc)[^,;.]*)"),
+                "$1 [REDACTED]$3"
+            )
     }
 
     fun sanitizeOutcome(outcome: TaskStepOutcome): TaskStepOutcome {
@@ -159,7 +167,8 @@ object TaskFollowUpClassifier {
         "pudhil step kara", "chalu rakho", "chalu kara", "continue karo", "resume karo",
         "aage ka step karo", "next step", "next step please", "do next step", "continue task",
         "resume task", "go ahead", "keep going", "proceed with task",
-        "आगे बढ़ो", "अगला स्टेप करो", "कंटिन्यू करो", "पुढे जा", "चालू ठेवा"
+        "आगे बढ़ो", "अगला स्टेप करो", "अगला स्टेप कर", "नेक्स्ट स्टेप करो", "जारी रखो", "कंटिन्यू करो",
+        "पुढे जा", "पुढील स्टेप कर", "पुढील स्टेप करा", "पुढचा स्टेप कर", "पुढचा स्टेप करा", "चालू ठेवा", "कंटिन्यू करा"
     )
 
     private val continueTokens = setOf(
@@ -228,6 +237,13 @@ class TaskContextStore(
     private var lastSummary: String? = null
     private var lastCompletedTaskId: String? = null
 
+    @Volatile
+    var onContextChanged: ((TaskContext?) -> Unit)? = null
+
+    private fun notifyChanged(ctx: TaskContext?) {
+        onContextChanged?.invoke(ctx)
+    }
+
     fun getActiveContext(): TaskContext? = synchronized(lock) { activeContext }
 
     fun getLastExecutionSummary(): String? = synchronized(lock) { lastSummary }
@@ -236,156 +252,196 @@ class TaskContextStore(
         activeContext?.state?.isActive() == true
     }
 
-    fun createTask(plan: UiTaskPlan): TaskContext = synchronized(lock) {
-        val current = activeContext
-        if (current != null && current.state.isActive()) {
-            throw IllegalStateException(
-                "Cannot create task '${plan.id}': active task '${current.taskId}' is already in state ${current.state}."
+    fun createTask(plan: UiTaskPlan): TaskContext {
+        val newContext = synchronized(lock) {
+            val current = activeContext
+            if (current != null && current.state.isActive()) {
+                throw IllegalStateException(
+                    "Cannot create task '${plan.id}': active task '${current.taskId}' is already in state ${current.state}."
+                )
+            }
+            val sanitizedSteps = plan.steps.map { TaskContextSanitizer.sanitizeStep(it) }
+            val nc = TaskContext(
+                taskId = plan.id,
+                originalRequest = TaskContextSanitizer.sanitizeSummaryText(plan.objective),
+                plannedSteps = sanitizedSteps,
+                remainingSteps = sanitizedSteps,
+                state = TaskLifecycleState.CREATED,
+                createdAtMs = nowMs(),
+                updatedAtMs = nowMs(),
+                expectedFinalPackage = plan.expectedFinalPackage,
+                expectedFinalElement = plan.expectedFinalElement
             )
+            activeContext = nc
+            nc
         }
-        val sanitizedSteps = plan.steps.map { TaskContextSanitizer.sanitizeStep(it) }
-        val newContext = TaskContext(
-            taskId = plan.id,
-            originalRequest = TaskContextSanitizer.sanitizeSummaryText(plan.objective),
-            plannedSteps = sanitizedSteps,
-            remainingSteps = sanitizedSteps,
-            state = TaskLifecycleState.CREATED,
-            createdAtMs = nowMs(),
-            updatedAtMs = nowMs(),
-            expectedFinalPackage = plan.expectedFinalPackage,
-            expectedFinalElement = plan.expectedFinalElement
-        )
-        activeContext = newContext
-        newContext
+        notifyChanged(newContext)
+        return newContext
     }
 
-    fun transitionTo(newState: TaskLifecycleState): TaskContext = synchronized(lock) {
-        val current = activeContext
-            ?: throw IllegalStateException("Cannot transition to $newState: no task context exists")
-        TaskLifecycleStateMachine.validateTransition(current.state, newState)
-        val updated = current.copy(state = newState, updatedAtMs = nowMs())
-        activeContext = updated
-        updated
+    fun transitionTo(newState: TaskLifecycleState): TaskContext {
+        val updated = synchronized(lock) {
+            val current = activeContext
+                ?: throw IllegalStateException("Cannot transition to $newState: no task context exists")
+            TaskLifecycleStateMachine.validateTransition(current.state, newState)
+            val u = current.copy(state = newState, updatedAtMs = nowMs())
+            activeContext = u
+            u
+        }
+        notifyChanged(updated)
+        return updated
     }
 
-    fun onStepStarted(step: PlannedTaskStep, remaining: List<PlannedTaskStep>): TaskContext = synchronized(lock) {
-        val current = activeContext
-            ?: throw IllegalStateException("Cannot mark step started: no active task context exists")
-        if (current.state == TaskLifecycleState.CREATED) {
-            TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.RUNNING)
+    fun onStepStarted(step: PlannedTaskStep, remaining: List<PlannedTaskStep>): TaskContext {
+        val updated = synchronized(lock) {
+            val current = activeContext
+                ?: throw IllegalStateException("Cannot mark step started: no active task context exists")
+            if (current.state == TaskLifecycleState.CREATED) {
+                TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.RUNNING)
+            }
+            val sanitizedStep = TaskContextSanitizer.sanitizeStep(step)
+            val sanitizedRemaining = remaining.map { TaskContextSanitizer.sanitizeStep(it) }
+            val u = current.copy(
+                state = TaskLifecycleState.RUNNING,
+                currentStep = sanitizedStep,
+                remainingSteps = sanitizedRemaining,
+                updatedAtMs = nowMs()
+            )
+            activeContext = u
+            u
         }
-        val sanitizedStep = TaskContextSanitizer.sanitizeStep(step)
-        val sanitizedRemaining = remaining.map { TaskContextSanitizer.sanitizeStep(it) }
-        val updated = current.copy(
-            state = TaskLifecycleState.RUNNING,
-            currentStep = sanitizedStep,
-            remainingSteps = sanitizedRemaining,
-            updatedAtMs = nowMs()
-        )
-        activeContext = updated
-        updated
+        notifyChanged(updated)
+        return updated
     }
 
     fun onStepCompleted(
         outcome: TaskStepOutcome,
         verifiedPackage: String,
         screenSnapshot: ScreenSnapshot? = null
-    ): TaskContext = synchronized(lock) {
-        val current = activeContext
-            ?: throw IllegalStateException("Cannot complete step: no active task context exists")
-        val sanitizedOutcome = TaskContextSanitizer.sanitizeOutcome(outcome)
-        val sanitizedSnapshot = TaskContextSanitizer.sanitizeSnapshot(screenSnapshot)
-        val updated = current.copy(
-            completedSteps = current.completedSteps + sanitizedOutcome,
-            currentStep = null,
-            lastVerifiedPackage = verifiedPackage.ifBlank { current.lastVerifiedPackage },
-            lastVerifiedSnapshot = sanitizedSnapshot ?: current.lastVerifiedSnapshot,
-            updatedAtMs = nowMs()
-        )
-        activeContext = updated
-        updated
+    ): TaskContext {
+        val updated = synchronized(lock) {
+            val current = activeContext
+                ?: throw IllegalStateException("Cannot complete step: no active task context exists")
+            val sanitizedOutcome = TaskContextSanitizer.sanitizeOutcome(outcome)
+            val sanitizedSnapshot = TaskContextSanitizer.sanitizeSnapshot(screenSnapshot)
+            val u = current.copy(
+                completedSteps = current.completedSteps + sanitizedOutcome,
+                currentStep = null,
+                lastVerifiedPackage = verifiedPackage.ifBlank { current.lastVerifiedPackage },
+                lastVerifiedSnapshot = sanitizedSnapshot ?: current.lastVerifiedSnapshot,
+                updatedAtMs = nowMs()
+            )
+            activeContext = u
+            u
+        }
+        notifyChanged(updated)
+        return updated
     }
 
-    fun onAwaitingConfirmation(pendingId: String, description: String): TaskContext = synchronized(lock) {
-        val current = activeContext
-            ?: throw IllegalStateException("Cannot await confirmation: no active task context exists")
-        TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.AWAITING_CONFIRMATION)
-        val updated = current.copy(
-            state = TaskLifecycleState.AWAITING_CONFIRMATION,
-            pendingConfirmationId = pendingId,
-            pendingConfirmationDescription = description,
-            updatedAtMs = nowMs()
-        )
-        activeContext = updated
-        updated
+    fun onAwaitingConfirmation(pendingId: String, description: String): TaskContext {
+        val updated = synchronized(lock) {
+            val current = activeContext
+                ?: throw IllegalStateException("Cannot await confirmation: no active task context exists")
+            TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.AWAITING_CONFIRMATION)
+            val u = current.copy(
+                state = TaskLifecycleState.AWAITING_CONFIRMATION,
+                pendingConfirmationId = pendingId,
+                pendingConfirmationDescription = description,
+                updatedAtMs = nowMs()
+            )
+            activeContext = u
+            u
+        }
+        notifyChanged(updated)
+        return updated
     }
 
     fun onRecoveryAttempted(
         failedOutcome: TaskStepOutcome,
         recoveryStep: PlannedTaskStep
-    ): TaskContext = synchronized(lock) {
-        val current = activeContext
-            ?: throw IllegalStateException("Cannot start recovery: no active task context exists")
-        TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.RECOVERING)
-        val sanitizedOutcome = TaskContextSanitizer.sanitizeOutcome(failedOutcome)
-        val sanitizedRecovery = TaskContextSanitizer.sanitizeStep(recoveryStep)
-        val updated = current.copy(
-            state = TaskLifecycleState.RECOVERING,
-            failedSteps = current.failedSteps + sanitizedOutcome,
-            remainingSteps = listOf(sanitizedRecovery) + current.remainingSteps,
-            recoveryAttempts = current.recoveryAttempts + 1,
-            updatedAtMs = nowMs()
-        )
-        activeContext = updated
-        updated
+    ): TaskContext {
+        val updated = synchronized(lock) {
+            val current = activeContext
+                ?: throw IllegalStateException("Cannot start recovery: no active task context exists")
+            TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.RECOVERING)
+            val sanitizedOutcome = TaskContextSanitizer.sanitizeOutcome(failedOutcome)
+            val sanitizedRecovery = TaskContextSanitizer.sanitizeStep(recoveryStep)
+            val u = current.copy(
+                state = TaskLifecycleState.RECOVERING,
+                failedSteps = current.failedSteps + sanitizedOutcome,
+                remainingSteps = listOf(sanitizedRecovery) + current.remainingSteps,
+                recoveryAttempts = current.recoveryAttempts + 1,
+                updatedAtMs = nowMs()
+            )
+            activeContext = u
+            u
+        }
+        notifyChanged(updated)
+        return updated
     }
 
-    fun pauseTask(reason: String = "Paused by user"): TaskContext = synchronized(lock) {
-        val current = activeContext
-            ?: throw IllegalStateException("Cannot pause task: no active task context exists")
-        TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.PAUSED)
-        val updated = current.copy(
-            state = TaskLifecycleState.PAUSED,
-            executionSummary = TaskContextSanitizer.sanitizeSummaryText(reason),
-            updatedAtMs = nowMs()
-        )
-        activeContext = updated
-        updated
+    fun pauseTask(reason: String = "Paused by user"): TaskContext {
+        val updated = synchronized(lock) {
+            val current = activeContext
+                ?: throw IllegalStateException("Cannot pause task: no active task context exists")
+            TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.PAUSED)
+            val u = current.copy(
+                state = TaskLifecycleState.PAUSED,
+                executionSummary = TaskContextSanitizer.sanitizeSummaryText(reason),
+                updatedAtMs = nowMs()
+            )
+            activeContext = u
+            u
+        }
+        notifyChanged(updated)
+        return updated
     }
 
-    fun completeTask(summary: String): TaskContext? = synchronized(lock) {
-        val current = activeContext ?: return null
-        TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.COMPLETED)
-        lastSummary = TaskContextSanitizer.sanitizeSummaryText(summary)
-        lastCompletedTaskId = current.taskId
-        // Clear task context from memory; preserve only minimal non-sensitive execution summary
-        activeContext = null
-        null
+    fun completeTask(summary: String): TaskContext? {
+        val result = synchronized(lock) {
+            val current = activeContext ?: return null
+            TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.COMPLETED)
+            lastSummary = TaskContextSanitizer.sanitizeSummaryText(summary)
+            lastCompletedTaskId = current.taskId
+            activeContext = null
+            null
+        }
+        notifyChanged(null)
+        return result
     }
 
-    fun failTask(summary: String, failedStepOutcome: TaskStepOutcome? = null): TaskContext? = synchronized(lock) {
-        val current = activeContext ?: return null
-        TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.FAILED)
-        lastSummary = TaskContextSanitizer.sanitizeSummaryText(summary)
-        lastCompletedTaskId = current.taskId
-        // Clear task context from memory; preserve only minimal non-sensitive summary
-        activeContext = null
-        null
+    fun failTask(summary: String, failedStepOutcome: TaskStepOutcome? = null): TaskContext? {
+        val result = synchronized(lock) {
+            val current = activeContext ?: return null
+            TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.FAILED)
+            lastSummary = TaskContextSanitizer.sanitizeSummaryText(summary)
+            lastCompletedTaskId = current.taskId
+            activeContext = null
+            null
+        }
+        notifyChanged(null)
+        return result
     }
 
-    fun cancelTask(summary: String = "Task cancelled"): TaskContext? = synchronized(lock) {
-        val current = activeContext ?: return null
-        TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.CANCELLED)
-        lastSummary = TaskContextSanitizer.sanitizeSummaryText(summary)
-        lastCompletedTaskId = current.taskId
-        // Clear task context from memory; preserve only minimal non-sensitive summary
-        activeContext = null
-        null
+    fun cancelTask(summary: String = "Task cancelled"): TaskContext? {
+        val result = synchronized(lock) {
+            val current = activeContext ?: return null
+            TaskLifecycleStateMachine.validateTransition(current.state, TaskLifecycleState.CANCELLED)
+            lastSummary = TaskContextSanitizer.sanitizeSummaryText(summary)
+            lastCompletedTaskId = current.taskId
+            activeContext = null
+            null
+        }
+        notifyChanged(null)
+        return result
     }
 
-    fun clear() = synchronized(lock) {
-        activeContext = null
-        lastSummary = null
-        lastCompletedTaskId = null
+    fun clear() {
+        synchronized(lock) {
+            activeContext = null
+            lastSummary = null
+            lastCompletedTaskId = null
+        }
+        notifyChanged(null)
     }
 }

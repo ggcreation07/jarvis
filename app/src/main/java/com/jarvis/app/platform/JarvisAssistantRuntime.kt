@@ -75,6 +75,14 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     val telemetry = DeviceTelemetry(context)
     val deviceController = DeviceController(context)
     val voiceController = VoiceController(context)
+    val capabilityRegistry = DeviceCapabilityRegistry(
+        context = context,
+        ttsReadyProvider = { voiceController.isTtsReady() },
+        speechAvailableProvider = { voiceController.isSpeechRecognitionAvailable() },
+        offlineSpeechConfirmedProvider = { voiceController.isOfflineSpeechRecognitionConfirmed() }
+    )
+    val capabilitiesSnapshot: StateFlow<DeviceCapabilitiesSnapshot>
+        get() = capabilityRegistry.capabilities
     private val firebaseAiService = FirebaseAiService()
     private val byoAiClient = ByoAiClient()
     val remotePcClient = RemotePcClient(context)
@@ -88,7 +96,8 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         firebaseAiService = firebaseAiService,
         remotePcClient = remotePcClient,
         tvControlClient = tvControlClient,
-        appContext = context
+        appContext = context,
+        capabilityRegistry = capabilityRegistry
     )
     private val orchestrator = JarvisOrchestrator(
         repository = repository,
@@ -96,7 +105,8 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         secretStore = secretStore,
         firebaseAiService = firebaseAiService,
         byoAiClient = byoAiClient,
-        toolExecutor = toolExecutor
+        toolExecutor = toolExecutor,
+        capabilityRegistry = capabilityRegistry
     )
 
     val screenConfig: StateFlow<ScreenConfig> = configStore.screenConfig
@@ -291,12 +301,17 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         }
         runtimeScope.launch {
             JarvisAccessibilityService.isConnectedState.collect { connected ->
-                _accessibilityConnected.value = connected && JarvisAccessibilityService.instance != null
+                val activeConn = connected && JarvisAccessibilityService.instance != null
+                _accessibilityConnected.value = activeConn
+                if (!activeConn) {
+                    toolExecutor.conversationContextManager.onAccessibilityDisconnected()
+                }
                 _accessibilityEnabled.value = try {
                     JarvisAccessibilityService.isEnabled(context)
                 } catch (_: Exception) {
                     false
                 }
+                capabilityRegistry.refresh(voiceController.isTtsReady())
             }
         }
         runtimeScope.launch {
@@ -424,7 +439,11 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         } catch (_: Exception) {
             false
         }
+        capabilityRegistry.refresh(voiceController.isTtsReady())
     }
+
+    fun refreshDeviceCapabilities(): DeviceCapabilitiesSnapshot =
+        capabilityRegistry.refresh(voiceController.isTtsReady())
 
     private fun refreshTelemetryOnly() {
         val currentNet = _telemetryState.value.network

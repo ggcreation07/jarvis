@@ -1662,12 +1662,13 @@ class UiTaskExecutionEngine(
         correctionsUsed: Int,
         verificationFailureReason: String?
     ): String {
+        val safeObjective = TaskContextSanitizer.sanitizeSummaryText(objective)
         val sb = StringBuilder()
         if (status == TaskExecutionStatus.SUCCEEDED) {
             val total = completedSteps.size + skippedSteps.size
-            sb.append("Completed task: $objective (${completedSteps.size}/$total verified steps). ")
+            sb.append("Completed task: $safeObjective (${completedSteps.size}/$total verified steps). ")
         }
-        sb.append("Requested goal: \"$objective\". ")
+        sb.append("Requested goal: \"$safeObjective\". ")
         sb.append("Final verification status: ${finalVerificationStatus.name}. ")
         if (completedSteps.isNotEmpty()) {
             sb.append("Verified completed steps (${completedSteps.size}): ${completedSteps.joinToString(" -> ") { "${it.stepIndex}. ${it.description}" }}. ")

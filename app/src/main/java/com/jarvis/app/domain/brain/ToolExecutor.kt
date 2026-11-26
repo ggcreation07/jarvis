@@ -12,6 +12,7 @@ import com.jarvis.app.domain.model.OverlayType
 import com.jarvis.app.domain.model.RoutineItem
 import com.jarvis.app.platform.ClickPrecheckOutcome
 import com.jarvis.app.platform.ClickUiElementResult
+import com.jarvis.app.platform.DeviceCapabilityRegistry
 import com.jarvis.app.platform.DeviceController
 import com.jarvis.app.platform.DeviceTelemetry
 import com.jarvis.app.platform.FindUiElementsResult
@@ -82,8 +83,15 @@ class ToolExecutor(
     private val appContext: Context? = null,
     private val accessibilityBridge: AccessibilityNavigationBridge? = null,
     private val screenReaderBridge: AccessibilityScreenReaderBridge? = null,
-    private val interactionBridge: AccessibilityInteractionBridge? = null
+    private val interactionBridge: AccessibilityInteractionBridge? = null,
+    private val capabilityRegistry: DeviceCapabilityRegistry? = null
 ) {
+    internal val localDeviceController: DeviceController get() = deviceController
+
+    internal suspend fun logLocalActionAudit(toolName: String, summary: String, ok: Boolean) {
+        repository.logAction(toolName, summary, ok)
+    }
+
     private fun navBridge(): AccessibilityNavigationBridge = accessibilityBridge ?: object : AccessibilityNavigationBridge {
         override fun isSettingsEnabled(): Boolean =
             appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
@@ -141,6 +149,14 @@ class ToolExecutor(
                 "Read external screen (${result.snapshot.packageName}, ${result.snapshot.nodes.size} nodes)"
             is ScreenReadResult.Error -> result.message
         }
+        conversationContextManager.recordCommandOutcome(
+            commandSummary = auditSummary,
+            toolName = callResult.toolName,
+            packageName = (result as? ScreenReadResult.Success)?.snapshot?.packageName.orEmpty(),
+            ok = callResult.ok,
+            statusLabel = if (callResult.ok) "OK" else "FAILED"
+        )
+        conversationContextManager.syncTaskAndConfirmation(taskContextStore, getPendingConfirmation())
         repository.logAction(callResult.toolName, auditSummary, callResult.ok)
         return callResult
     }
@@ -148,10 +164,22 @@ class ToolExecutor(
     internal suspend fun readScreenRaw(): ScreenReadResult {
         val bridge = screenReaderBridge
         if (bridge != null) {
-            return bridge.readScreen()
+            val res = bridge.readScreen()
+            when (res) {
+                is ScreenReadResult.Success -> conversationContextManager.recordScreenSnapshot(res.snapshot)
+                is ScreenReadResult.Error -> {
+                    if (res.code == ScreenReadErrorCode.SERVICE_NOT_CONNECTED ||
+                        res.code == ScreenReadErrorCode.SERVICE_ENABLED_BUT_DISCONNECTED
+                    ) {
+                        conversationContextManager.onAccessibilityDisconnected()
+                    }
+                }
+            }
+            return res
         }
         val service = JarvisAccessibilityService.instance
         if (service == null || !JarvisAccessibilityService.isConnected) {
+            conversationContextManager.onAccessibilityDisconnected()
             val enabled = appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
             return if (enabled) {
                 ScreenReadResult.Error(
@@ -165,7 +193,18 @@ class ToolExecutor(
                 )
             }
         }
-        return service.readScreen()
+        val res = service.readScreen()
+        when (res) {
+            is ScreenReadResult.Success -> conversationContextManager.recordScreenSnapshot(res.snapshot)
+            is ScreenReadResult.Error -> {
+                if (res.code == ScreenReadErrorCode.SERVICE_NOT_CONNECTED ||
+                    res.code == ScreenReadErrorCode.SERVICE_ENABLED_BUT_DISCONNECTED
+                ) {
+                    conversationContextManager.onAccessibilityDisconnected()
+                }
+            }
+        }
+        return res
     }
 
     private fun parseUiQuery(args: Map<String, JsonElement>): UiElementQuery = UiElementQuery(
@@ -190,10 +229,19 @@ class ToolExecutor(
         clickableOnly = false
     )
 
-    private suspend fun findUiElementsRaw(query: UiElementQuery): FindUiElementsResult {
-        interactionBridge?.let { return it.findElements(query) }
+    internal suspend fun findUiElementsRaw(query: UiElementQuery): FindUiElementsResult {
+        interactionBridge?.let {
+            val found = it.findElements(query)
+            if (found.status == ScreenInteractionStatus.SERVICE_DISCONNECTED) {
+                conversationContextManager.onAccessibilityDisconnected()
+            } else {
+                conversationContextManager.recordFoundElements(found)
+            }
+            return found
+        }
         val service = JarvisAccessibilityService.instance
         if (service == null || !JarvisAccessibilityService.isConnected) {
+            conversationContextManager.onAccessibilityDisconnected()
             val enabled = appContext?.let { JarvisAccessibilityService.isEnabled(it) } ?: false
             val msg = if (enabled) {
                 "Accessibility Phone Control is enabled in Android Settings, but the service is disconnected. Reconnect JARVIS Phone Control in Accessibility Settings."
@@ -202,7 +250,13 @@ class ToolExecutor(
             }
             return FindUiElementsResult(ScreenInteractionStatus.SERVICE_DISCONNECTED, msg)
         }
-        return service.findUiElements(query)
+        val found = service.findUiElements(query)
+        if (found.status == ScreenInteractionStatus.SERVICE_DISCONNECTED) {
+            conversationContextManager.onAccessibilityDisconnected()
+        } else {
+            conversationContextManager.recordFoundElements(found)
+        }
+        return found
     }
 
     private suspend fun inspectClickCandidateRaw(query: UiElementQuery): ClickPrecheckOutcome {
@@ -319,15 +373,61 @@ class ToolExecutor(
 
     val uiTaskExecutionEngine: UiTaskExecutionEngine by lazy { UiTaskExecutionEngine(this) }
 
+    val localDeviceTaskExecutor: LocalDeviceTaskExecutor by lazy {
+        LocalDeviceTaskExecutor(
+            toolExecutor = this,
+            capabilityRegistryProvider = { capabilityRegistry },
+            nowMs = nowMs
+        )
+    }
+
     val taskContextStore: TaskContextStore get() = uiTaskExecutionEngine.taskContextStore
 
-    fun pauseActiveUiTask(): Boolean = uiTaskExecutionEngine.pauseActiveTask()
+    val conversationContextManager: LocalConversationContextManager by lazy {
+        LocalConversationContextManager(nowMs = nowMs)
+    }
+
+    init {
+        taskContextStore.onContextChanged = {
+            conversationContextManager.syncTaskAndConfirmation(taskContextStore, getPendingConfirmation())
+        }
+    }
+
+    fun pauseActiveUiTask(): Boolean {
+        val paused = localDeviceTaskExecutor.pauseActiveTask() || uiTaskExecutionEngine.pauseActiveTask()
+        conversationContextManager.syncTaskAndConfirmation(taskContextStore, getPendingConfirmation())
+        return paused
+    }
 
     suspend fun resumeActiveUiTask(
         onProgress: suspend (TaskProgressEvent) -> Unit = {}
-    ): TaskExecutionReport = uiTaskExecutionEngine.resumeActiveTask(onProgress)
+    ): TaskExecutionReport {
+        val report = if (localDeviceTaskExecutor.hasPausedTask()) {
+            localDeviceTaskExecutor.resumeActiveTask(onProgress)
+        } else {
+            uiTaskExecutionEngine.resumeActiveTask(onProgress)
+        }
+        conversationContextManager.syncTaskAndConfirmation(taskContextStore, getPendingConfirmation())
+        return report
+    }
 
-    fun cancelActiveUiTask(): Boolean = uiTaskExecutionEngine.cancelActiveTask()
+    fun cancelActiveUiTask(): Boolean {
+        val localCancelled = localDeviceTaskExecutor.cancelActiveTask()
+        val uiCancelled = uiTaskExecutionEngine.cancelActiveTask()
+        conversationContextManager.onTaskCancelledOrCleared()
+        return localCancelled || uiCancelled
+    }
+
+    suspend fun resumePendingTaskAfterConfirmation(
+        pendingConfirmationId: String,
+        confirmedResult: ToolCallExecutionResult,
+        onProgress: suspend (TaskProgressEvent) -> Unit = {}
+    ): TaskExecutionReport? {
+        val rep = localDeviceTaskExecutor.resumeIfPending(pendingConfirmationId, confirmedResult, onProgress)
+            ?: uiTaskExecutionEngine.resumeIfPending(pendingConfirmationId, confirmedResult, onProgress)
+        conversationContextManager.syncTaskAndConfirmation(taskContextStore, getPendingConfirmation())
+        return rep
+    }
 
     fun getPendingConfirmation(): PendingProtectedAction? = synchronized(confirmationLock) {
         pendingConfirmation?.takeIf { nowMs() <= it.expiresAtMs }
@@ -337,10 +437,12 @@ class ToolExecutor(
         synchronized(confirmationLock) {
             pendingConfirmation = null
         }
+        localDeviceTaskExecutor.clearPendingContinuation()
         uiTaskExecutionEngine.clearPendingContinuation()
         if (uiTaskExecutionEngine.taskContextStore.getActiveContext()?.state == TaskLifecycleState.AWAITING_CONFIRMATION) {
             uiTaskExecutionEngine.taskContextStore.cancelTask("Pending confirmation cleared or superseded.")
         }
+        conversationContextManager.syncTaskAndConfirmation(taskContextStore, null)
     }
 
     suspend fun handleConfirmationInput(
@@ -364,10 +466,12 @@ class ToolExecutor(
 
         val intent = ConfirmationClassifier.classify(rawInput)
         if (isExpired) {
+            localDeviceTaskExecutor.clearPendingContinuation()
             uiTaskExecutionEngine.clearPendingContinuation()
             if (uiTaskExecutionEngine.taskContextStore.getActiveContext()?.state == TaskLifecycleState.AWAITING_CONFIRMATION) {
                 uiTaskExecutionEngine.taskContextStore.cancelTask("Confirmation expired.")
             }
+            conversationContextManager.syncTaskAndConfirmation(taskContextStore, null)
             return when (intent) {
                 ConfirmationIntent.CANCEL -> ConfirmationTurnOutcome.Cancelled(
                     actionDescription = current.description,
@@ -551,6 +655,7 @@ class ToolExecutor(
                 }
             }
             if (blockedSummary != null) {
+                conversationContextManager.syncTaskAndConfirmation(taskContextStore, getPendingConfirmation())
                 repository.logAction(normalizedName, "Confirmation required: $blockedDescription", false)
                 return confirmationRequired(normalizedName, blockedId, blockedDescription, blockedSummary)
             }
@@ -731,8 +836,18 @@ class ToolExecutor(
                     "media_play_pause" -> deviceController.sendMediaKey("play_pause")
                     "media_next" -> deviceController.sendMediaKey("next")
                     "media_prev" -> deviceController.sendMediaKey("previous")
-                    "wifi_settings" -> deviceController.openSettingsScreen(Settings.ACTION_WIFI_SETTINGS)
-                    "bluetooth_settings" -> deviceController.openSettingsScreen(Settings.ACTION_BLUETOOTH_SETTINGS)
+                    "wifi_settings" -> deviceController.openSettingsScreen(Settings.ACTION_WIFI_SETTINGS, "Wi-Fi Settings")
+                    "bluetooth_settings" -> deviceController.openSettingsScreen(Settings.ACTION_BLUETOOTH_SETTINGS, "Bluetooth Settings")
+                    "accessibility_settings" -> deviceController.openSettingsScreen(Settings.ACTION_ACCESSIBILITY_SETTINGS, "Accessibility Settings")
+                    "notification_listener_settings" -> deviceController.openSettingsScreen(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS, "Notification Access Settings")
+                    "dnd_settings" -> deviceController.openSettingsScreen(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS, "Do Not Disturb Access Settings")
+                    "display_settings" -> deviceController.openSettingsScreen(Settings.ACTION_DISPLAY_SETTINGS, "Display Settings")
+                    "sound_settings" -> deviceController.openSettingsScreen(Settings.ACTION_SOUND_SETTINGS, "Sound Settings")
+                    "battery_settings" -> deviceController.openBatterySettings()
+                    "location_settings" -> deviceController.openSettingsScreen(Settings.ACTION_LOCATION_SOURCE_SETTINGS, "Location Settings")
+                    "apps_settings" -> deviceController.openSettingsScreen(Settings.ACTION_APPLICATION_SETTINGS, "Apps Settings")
+                    "default_assistant_settings" -> deviceController.openDefaultAssistantSettings()
+                    "system_settings" -> deviceController.openSettingsScreen(Settings.ACTION_SETTINGS, "Android System Settings")
                     else -> com.jarvis.app.platform.ActionOutcome(false, "Unknown device action: $action")
                 }
                 if (outcome.ok) ok("device_control", outcome.summary) else fail("device_control", outcome.summary)
@@ -1119,8 +1234,67 @@ class ToolExecutor(
         } else {
             result.summary
         }
+        recordContextAfterToolExecution(normalizedName, effectiveArgs, result, auditSummary)
         repository.logAction(result.toolName, auditSummary, result.ok)
         return result
+    }
+
+    private fun recordContextAfterToolExecution(
+        toolName: String,
+        args: Map<String, JsonElement>,
+        result: ToolCallExecutionResult,
+        auditSummary: String
+    ) {
+        when (toolName) {
+            "open_application" -> {
+                val name = strArg(args, "name")
+                if (result.ok && name.isNotBlank() && !name.startsWith("uninstall ", true) && !name.startsWith("delete ", true)) {
+                    val resolved = deviceController.resolveApplication(name)
+                    if (resolved != null) {
+                        conversationContextManager.onForegroundAppObserved(resolved.packageName, resolved.label)
+                    } else {
+                        conversationContextManager.onForegroundAppObserved(name, name)
+                    }
+                }
+            }
+            "device_control" -> {
+                val action = strArg(args, "action")
+                if (result.ok && action.endsWith("_settings")) {
+                    conversationContextManager.recordSettingsOpened(action, action.replace('_', ' '))
+                }
+            }
+            "scroll_ui" -> {
+                val dir = strArg(args, "direction")
+                val pkg = result.payload["package_name"]?.jsonPrimitive?.content.orEmpty()
+                if (result.ok && dir.isNotBlank()) {
+                    conversationContextManager.recordScroll(dir, pkg)
+                }
+            }
+            "control_interface" -> {
+                if (strArg(args, "action") == "clear_chat") {
+                    conversationContextManager.clear()
+                    return
+                }
+            }
+            "accessibility_navigate" -> {
+                val action = strArg(args, "action")
+                if (result.ok && action == "home") {
+                    conversationContextManager.onForegroundAppObserved("com.android.launcher", "Home")
+                }
+            }
+        }
+        val pkg = result.payload["package_name"]?.jsonPrimitive?.content.orEmpty()
+        val label = strArg(args, "_resolved_label").ifBlank { strArg(args, "text") }.ifBlank { strArg(args, "name") }
+        conversationContextManager.recordCommandOutcome(
+            commandSummary = auditSummary,
+            toolName = result.toolName,
+            packageName = pkg,
+            appLabel = if (toolName == "open_application") strArg(args, "name") else "",
+            targetLabel = if (toolName == "type_text") strArg(args, "hint").ifBlank { strArg(args, "view_id") } else label,
+            ok = result.ok,
+            statusLabel = result.payload["result_code"]?.jsonPrimitive?.content.orEmpty().ifBlank { if (result.ok) "OK" else "FAILED" }
+        )
+        conversationContextManager.syncTaskAndConfirmation(taskContextStore, getPendingConfirmation())
     }
 
     private suspend fun resolveCoordinates(): Triple<Double, Double, String>? {

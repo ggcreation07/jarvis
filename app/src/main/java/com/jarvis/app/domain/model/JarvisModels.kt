@@ -142,7 +142,14 @@ data class BrainConfig(
     val tvPort: Int = 5555,
     val tvName: String = "",
     val tvMacAddress: String = "",
-    val tvPaired: Boolean = false
+    val tvPaired: Boolean = false,
+    val voiceGender: String = "male",
+    val autoLanguageDetectionEnabled: Boolean = true,
+    val matchSpeakingStyleEnabled: Boolean = true,
+    val preferredLanguage: String = "auto",
+    val selectedVoiceName: String = "",
+    val allowVoiceFallbackWithApproval: Boolean = false,
+    val elevenLabsVoiceId: String = ""
 )
 
 @Immutable

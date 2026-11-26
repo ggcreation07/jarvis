@@ -30,50 +30,273 @@ data class ActionOutcome(
     val summary: String
 )
 
+data class ResolvedAppInfo(
+    val packageName: String,
+    val label: String
+)
+
+data class VolumeStateSnapshot(
+    val streamVolume: Int,
+    val maxVolume: Int,
+    val isMuted: Boolean,
+    val isFixed: Boolean
+)
+
 class DeviceController(private val context: Context) {
 
+    @Volatile
     private var torchEnabled = false
+
+    @Volatile
+    private var lastVerifiedTorchState: Boolean? = null
+
+    internal var torchStateVerifierOverride: ((cameraId: String, expectedOn: Boolean) -> Boolean?)? = null
+    internal var volumeStateOverride: (() -> VolumeStateSnapshot?)? = null
+
+    fun findFlashlightCameraId(): String? {
+        return try {
+            val cm = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager ?: return null
+            cm.cameraIdList.firstOrNull { id ->
+                runCatching {
+                    cm.getCameraCharacteristics(id).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                }.getOrDefault(false)
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     fun toggleFlashlight(enable: Boolean? = null): ActionOutcome {
         return try {
-            val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val cameraId = cm.cameraIdList.firstOrNull { id ->
-                cm.getCameraCharacteristics(id).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
-            } ?: return ActionOutcome(false, "No camera flash hardware found on this device.")
+            val cm = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+                ?: return ActionOutcome(false, "Camera service is unavailable on this device.")
+            val cameraId = findFlashlightCameraId()
+                ?: return ActionOutcome(false, "No camera flash hardware found on this device.")
             val next = enable ?: !torchEnabled
-            cm.setTorchMode(cameraId, next)
+
+            val overrideVerifier = torchStateVerifierOverride
+            if (overrideVerifier != null) {
+                cm.setTorchMode(cameraId, next)
+                val observed = overrideVerifier(cameraId, next)
+                if (observed != null && observed != next) {
+                    return ActionOutcome(
+                        false,
+                        "Flashlight state could not be verified (expected ${if (next) "on" else "off"}, reported ${if (observed) "on" else "off"})."
+                    )
+                }
+                torchEnabled = next
+                lastVerifiedTorchState = observed ?: next
+                val suffix = if (observed != null) " (verified)" else ""
+                return ActionOutcome(true, if (next) "Flashlight turned on$suffix." else "Flashlight turned off$suffix.")
+            }
+
+            // Observe OS TorchCallback where supported on a short-lived HandlerThread
+            val thread = android.os.HandlerThread("jarvis-torch-verify").apply { start() }
+            val handler = android.os.Handler(thread.looper)
+            val initialLatch = java.util.concurrent.CountDownLatch(1)
+            val transitionLatch = java.util.concurrent.CountDownLatch(1)
+            val sawAnyCallback = java.util.concurrent.atomic.AtomicBoolean(false)
+            val torchUnavailable = java.util.concurrent.atomic.AtomicBoolean(false)
+            val targetObserved = java.util.concurrent.atomic.AtomicBoolean(false)
+            val latestState = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
+            val postSetIssued = java.util.concurrent.atomic.AtomicBoolean(false)
+
+            val callback = object : CameraManager.TorchCallback() {
+                override fun onTorchModeUnavailable(camId: String) {
+                    if (camId == cameraId) {
+                        sawAnyCallback.set(true)
+                        torchUnavailable.set(true)
+                        initialLatch.countDown()
+                        if (postSetIssued.get()) transitionLatch.countDown()
+                    }
+                }
+
+                override fun onTorchModeChanged(camId: String, enabled: Boolean) {
+                    if (camId == cameraId) {
+                        sawAnyCallback.set(true)
+                        torchUnavailable.set(false)
+                        latestState.set(enabled)
+                        initialLatch.countDown()
+                        if (postSetIssued.get() && enabled == next) {
+                            targetObserved.set(true)
+                            transitionLatch.countDown()
+                        }
+                    }
+                }
+            }
+
+            try {
+                cm.registerTorchCallback(callback, handler)
+                initialLatch.await(50, java.util.concurrent.TimeUnit.MILLISECONDS)
+                postSetIssued.set(true)
+                cm.setTorchMode(cameraId, next)
+                if (sawAnyCallback.get()) {
+                    transitionLatch.await(180, java.util.concurrent.TimeUnit.MILLISECONDS)
+                }
+            } finally {
+                runCatching { cm.unregisterTorchCallback(callback) }
+                runCatching { thread.quitSafely() }
+            }
+
+            if (torchUnavailable.get()) {
+                return ActionOutcome(false, "Flashlight is currently in use or unavailable.")
+            }
+            val observedState = latestState.get()
+            if (sawAnyCallback.get() && !targetObserved.get() && observedState != next) {
+                return ActionOutcome(
+                    false,
+                    "Flashlight state could not be verified (expected ${if (next) "on" else "off"}, reported ${observedState?.let { if (it) "on" else "off" } ?: "unknown"})."
+                )
+            }
+
             torchEnabled = next
-            ActionOutcome(true, if (next) "Flashlight turned on." else "Flashlight turned off.")
+            lastVerifiedTorchState = if (sawAnyCallback.get()) observedState else null
+            val verifiedNote = if (sawAnyCallback.get() && (targetObserved.get() || observedState == next)) " (verified)" else ""
+            ActionOutcome(true, if (next) "Flashlight turned on$verifiedNote." else "Flashlight turned off$verifiedNote.")
         } catch (e: Exception) {
             ActionOutcome(false, "Couldn't toggle flashlight: ${e.message ?: "unavailable"}")
         }
     }
 
+    fun verifyFlashlightState(expectedOn: Boolean): ActionOutcome {
+        val cameraId = findFlashlightCameraId()
+            ?: return ActionOutcome(false, "No camera flash hardware found on this device.")
+        val overrideVerifier = torchStateVerifierOverride
+        if (overrideVerifier != null) {
+            val actual = overrideVerifier(cameraId, expectedOn)
+            return if (actual == expectedOn) {
+                ActionOutcome(true, "Verified flashlight is ${if (expectedOn) "on" else "off"}.")
+            } else {
+                ActionOutcome(false, "Flashlight verification failed (expected ${if (expectedOn) "on" else "off"}, actual ${actual ?: "unknown"}). ")
+            }
+        }
+        val thread = android.os.HandlerThread("jarvis-torch-check").apply { start() }
+        val handler = android.os.Handler(thread.looper)
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val sawCallback = java.util.concurrent.atomic.AtomicBoolean(false)
+        val unavailable = java.util.concurrent.atomic.AtomicBoolean(false)
+        val actualState = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
+        val cm = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            ?: return ActionOutcome(false, "Camera service is unavailable.")
+        val cb = object : CameraManager.TorchCallback() {
+            override fun onTorchModeUnavailable(camId: String) {
+                if (camId == cameraId) {
+                    sawCallback.set(true)
+                    unavailable.set(true)
+                    latch.countDown()
+                }
+            }
+
+            override fun onTorchModeChanged(camId: String, enabled: Boolean) {
+                if (camId == cameraId) {
+                    sawCallback.set(true)
+                    unavailable.set(false)
+                    actualState.set(enabled)
+                    latch.countDown()
+                }
+            }
+        }
+        try {
+            cm.registerTorchCallback(cb, handler)
+            latch.await(120, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } finally {
+            runCatching { cm.unregisterTorchCallback(cb) }
+            runCatching { thread.quitSafely() }
+        }
+        if (unavailable.get()) {
+            return ActionOutcome(false, "Flashlight verification failed: torch mode unavailable.")
+        }
+        if (sawCallback.get()) {
+            val resolvedState = actualState.get()
+            return if (resolvedState == expectedOn) {
+                lastVerifiedTorchState = resolvedState
+                ActionOutcome(true, "Verified flashlight is ${if (expectedOn) "on" else "off"}.")
+            } else {
+                ActionOutcome(false, "Flashlight verification failed: expected ${if (expectedOn) "on" else "off"}, reported ${resolvedState?.let { if (it) "on" else "off" } ?: "unknown"}.")
+            }
+        }
+        return if (lastVerifiedTorchState == expectedOn || torchEnabled == expectedOn) {
+            ActionOutcome(true, "Camera flash unit present and torch request ${if (expectedOn) "on" else "off"} completed.")
+        } else {
+            ActionOutcome(false, "Flashlight state does not match expected ${if (expectedOn) "on" else "off"}.")
+        }
+    }
+
+    fun readVolumeState(): VolumeStateSnapshot? {
+        volumeStateOverride?.let { return it.invoke() }
+        return try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return null
+            VolumeStateSnapshot(
+                streamVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC),
+                maxVolume = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1),
+                isMuted = am.isStreamMute(AudioManager.STREAM_MUSIC),
+                isFixed = am.isVolumeFixed
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun adjustVolume(direction: String, levelPercent: Int? = null): ActionOutcome {
         return try {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                ?: return ActionOutcome(false, "Audio service is unavailable on this device.")
+            if (am.isVolumeFixed) {
+                return ActionOutcome(false, "Device volume is fixed by the system and cannot be adjusted.")
+            }
             val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+            val beforeVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            val wasMuted = am.isStreamMute(AudioManager.STREAM_MUSIC)
+
             when {
                 levelPercent != null -> {
                     val target = ((levelPercent.coerceIn(0, 100) / 100f) * max).toInt()
                     am.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
-                    ActionOutcome(true, "Media volume set to ${levelPercent.coerceIn(0, 100)}%.")
+                    val afterVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    if (afterVol == target) {
+                        ActionOutcome(true, "Media volume set to ${levelPercent.coerceIn(0, 100)}% ($afterVol/$max).")
+                    } else {
+                        ActionOutcome(false, "Couldn't verify volume change (expected $target/$max, actual $afterVol/$max).")
+                    }
                 }
                 direction == "up" -> {
                     am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
-                    ActionOutcome(true, "Turned media volume up.")
+                    val afterVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    val isMutedNow = am.isStreamMute(AudioManager.STREAM_MUSIC)
+                    when {
+                        beforeVol >= max && afterVol >= max -> ActionOutcome(true, "Media volume is already at maximum ($afterVol/$max).")
+                        afterVol > beforeVol || (wasMuted && !isMutedNow) -> ActionOutcome(true, "Turned media volume up ($afterVol/$max).")
+                        else -> ActionOutcome(false, "Volume adjustment could not be verified (stayed at $afterVol/$max).")
+                    }
                 }
                 direction == "down" -> {
                     am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
-                    ActionOutcome(true, "Turned media volume down.")
+                    val afterVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    when {
+                        beforeVol <= 0 && afterVol <= 0 -> ActionOutcome(true, "Media volume is already at minimum (0/$max).")
+                        afterVol < beforeVol -> ActionOutcome(true, "Turned media volume down ($afterVol/$max).")
+                        else -> ActionOutcome(false, "Volume adjustment could not be verified (stayed at $afterVol/$max).")
+                    }
                 }
                 direction == "mute" -> {
                     am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, AudioManager.FLAG_SHOW_UI)
-                    ActionOutcome(true, "Media volume muted.")
+                    val afterVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    val isMutedNow = am.isStreamMute(AudioManager.STREAM_MUSIC)
+                    when {
+                        wasMuted && (isMutedNow || afterVol == 0) -> ActionOutcome(true, "Media volume is already muted.")
+                        isMutedNow || afterVol == 0 -> ActionOutcome(true, "Media volume muted.")
+                        else -> ActionOutcome(false, "Mute could not be verified (media volume remained at $afterVol/$max).")
+                    }
                 }
                 direction == "unmute" -> {
                     am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, AudioManager.FLAG_SHOW_UI)
-                    ActionOutcome(true, "Media volume unmuted.")
+                    val afterVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    val isMutedNow = am.isStreamMute(AudioManager.STREAM_MUSIC)
+                    if (!isMutedNow) {
+                        ActionOutcome(true, "Media volume unmuted ($afterVol/$max).")
+                    } else {
+                        ActionOutcome(false, "Unmute could not be verified (media volume is still muted).")
+                    }
                 }
                 else -> ActionOutcome(false, "Unsupported volume adjustment.")
             }
@@ -83,17 +306,30 @@ class DeviceController(private val context: Context) {
     }
 
     fun setDoNotDisturb(enable: Boolean): ActionOutcome {
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            ?: return ActionOutcome(false, "Notification service is unavailable on this device.")
         if (!nm.isNotificationPolicyAccessGranted) {
-            openSettingsScreen(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)
+            openSettingsScreen(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS, "Do Not Disturb Access Settings")
             return ActionOutcome(false, "Opened Do Not Disturb access settings so you can grant permission.")
         }
         return try {
-            nm.setInterruptionFilter(
-                if (enable) NotificationManager.INTERRUPTION_FILTER_PRIORITY
-                else NotificationManager.INTERRUPTION_FILTER_ALL
-            )
-            ActionOutcome(true, if (enable) "Do Not Disturb enabled." else "Do Not Disturb disabled.")
+            val targetFilter = if (enable) {
+                NotificationManager.INTERRUPTION_FILTER_PRIORITY
+            } else {
+                NotificationManager.INTERRUPTION_FILTER_ALL
+            }
+            nm.setInterruptionFilter(targetFilter)
+            val currentFilter = nm.currentInterruptionFilter
+            val verified = if (enable) {
+                currentFilter != NotificationManager.INTERRUPTION_FILTER_ALL
+            } else {
+                currentFilter == NotificationManager.INTERRUPTION_FILTER_ALL
+            }
+            if (verified) {
+                ActionOutcome(true, if (enable) "Do Not Disturb enabled." else "Do Not Disturb disabled.")
+            } else {
+                ActionOutcome(false, "Do Not Disturb state change could not be verified (filter=$currentFilter).")
+            }
         } catch (e: Exception) {
             ActionOutcome(false, "Couldn't update Do Not Disturb: ${e.message}")
         }
@@ -113,28 +349,47 @@ class DeviceController(private val context: Context) {
         return ActionOutcome(true, "Sent media $action.")
     }
 
-    fun openApplication(nameOrPackage: String): ActionOutcome {
+    fun resolveMatchingApplications(nameOrPackage: String): List<ResolvedAppInfo> {
         val query = nameOrPackage.trim()
-        if (query.isEmpty()) return ActionOutcome(false, "Tell me which app to open.")
+        if (query.isEmpty()) return emptyList()
         val pm = context.packageManager
         val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val apps = pm.queryIntentActivities(mainIntent, 0)
-        val match = apps.firstOrNull {
+        val exact = apps.filter {
             val label = it.loadLabel(pm).toString()
             label.equals(query, ignoreCase = true) || it.activityInfo.packageName.equals(query, ignoreCase = true)
-        } ?: apps.firstOrNull {
-            val label = it.loadLabel(pm).toString()
-            label.contains(query, ignoreCase = true)
         }
-        if (match == null) return ActionOutcome(false, "I couldn't find an app matching \"$query\".")
-        val launch = pm.getLaunchIntentForPackage(match.activityInfo.packageName)
+        val selected = if (exact.isNotEmpty()) {
+            exact
+        } else {
+            apps.filter {
+                val label = it.loadLabel(pm).toString()
+                label.contains(query, ignoreCase = true)
+            }
+        }
+        return selected.distinctBy { it.activityInfo.packageName }.map { info ->
+            val label = info.loadLabel(pm).toString().ifBlank { info.activityInfo.packageName }
+            ResolvedAppInfo(packageName = info.activityInfo.packageName, label = label)
+        }
+    }
+
+    fun resolveApplication(nameOrPackage: String): ResolvedAppInfo? =
+        resolveMatchingApplications(nameOrPackage).firstOrNull()
+
+    fun openApplication(nameOrPackage: String): ActionOutcome {
+        val query = nameOrPackage.trim()
+        if (query.isEmpty()) return ActionOutcome(false, "Tell me which app to open.")
+        val resolved = resolveApplication(query)
+            ?: return ActionOutcome(false, "I couldn't find an app matching \"$query\".")
+        val pm = context.packageManager
+        val launch = pm.getLaunchIntentForPackage(resolved.packageName)
             ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             ?: return ActionOutcome(false, "That app can't be launched directly.")
         return try {
             context.startActivity(launch)
-            ActionOutcome(true, "Opened ${match.loadLabel(pm)}.")
+            ActionOutcome(true, "Opened ${resolved.label}.")
         } catch (e: Exception) {
-            ActionOutcome(false, "Couldn't open ${match.loadLabel(pm)}: ${e.message}")
+            ActionOutcome(false, "Couldn't open ${resolved.label}: ${e.message}")
         }
     }
 
@@ -150,14 +405,31 @@ class DeviceController(private val context: Context) {
         }
     }
 
-    fun openSettingsScreen(action: String): ActionOutcome {
+    fun openSettingsScreen(action: String, label: String = "Android settings"): ActionOutcome {
         return try {
             val intent = Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             context.startActivity(intent)
-            ActionOutcome(true, "Opened Android settings.")
+            ActionOutcome(true, "Opened $label.")
         } catch (e: Exception) {
-            ActionOutcome(false, "Couldn't open settings: ${e.message}")
+            ActionOutcome(false, "Couldn't open $label: ${e.message ?: "unavailable"}")
         }
+    }
+
+    fun openBatterySettings(): ActionOutcome {
+        val candidates = listOf(
+            Settings.ACTION_BATTERY_SAVER_SETTINGS to "Battery Saver settings",
+            Intent.ACTION_POWER_USAGE_SUMMARY to "Battery usage settings",
+            Settings.ACTION_SETTINGS to "Android settings"
+        )
+        for ((action, label) in candidates) {
+            val intent = Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val resolved = runCatching { context.packageManager.resolveActivity(intent, 0) != null }.getOrDefault(false)
+            if (resolved || action == Settings.ACTION_SETTINGS) {
+                val res = openSettingsScreen(action, label)
+                if (res.ok) return res
+            }
+        }
+        return openSettingsScreen(Settings.ACTION_BATTERY_SAVER_SETTINGS, "Battery settings")
     }
 
     fun openDefaultAssistantSettings(): ActionOutcome {

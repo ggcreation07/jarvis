@@ -188,6 +188,9 @@ object DirectCommandMatcher {
             return DirectActionMatch.ToolCall("set_timer", mapOf("seconds" to secs.toString()))
         }
 
+        // Notification reading (English, Hinglish, Hindi, Marathi)
+        matchNotificationQuery(cleaned, lower)?.let { return it }
+
         // Global Android navigation (Accessibility Service) - must precede generic openApp rule
         matchAccessibilityNavigation(cleaned, lower)?.let { return it }
 
@@ -289,6 +292,70 @@ object DirectCommandMatcher {
 
             else -> null
         }
+    }
+
+    private fun matchNotificationQuery(cleaned: String, lower: String): DirectActionMatch.ToolCall? {
+        // 1. Latest notification queries
+        val isLatest = Regex(
+            "^(?:what(?:'s| is) the )?(?:latest|last|newest|most recent) notification(?:\\s+from\\s+.*)?$"
+        ).matches(lower) ||
+            Regex("^(?:read|check|show|tell me) (?:the )?(?:latest|last|newest) notification$").matches(lower) ||
+            Regex("^(?:latest|last|nayi|nai|aakhri|akhri) notification (?:kiski|kiska|kisne|kya|padho|sunao|batao|dikhao)(?: hai)?$").matches(lower) ||
+            Regex("^(?:नवीनतम|नया|आखिरी|ताजा|लेटेस्ट) नोटिफिकेशन (?:किसका है|क्या है|किसने भेजा|पढ़ो|पढ़ें|सुनाओ|बताओ)$").matches(cleaned) ||
+            Regex("^(?:नवीन|नवीनतम|शेवटचे|लेटेस्ट) नोटिफिकेशन (?:कोणाचे आहे|काय आहे|वाच|वाचा|सांग|सांगा)$").matches(cleaned)
+        if (isLatest) {
+            return DirectActionMatch.ToolCall(
+                toolName = "read_notifications",
+                args = mapOf("latest_only" to "true")
+            )
+        }
+
+        // 2. General active notification reading
+        val isReadAll = Regex(
+            "^(?:read|check|summarize|tell me)(?: all| my)? notifications?(?: please)?$"
+        ).matches(lower) ||
+            Regex("^(?:what are |any )?(?:my |new |unread )?notifications?$").matches(lower) ||
+            Regex("^(?:mere |meri |apne )?notifications? (?:padho|padh ke sunao|read karo|sunao|batao|dikhao)$").matches(lower) ||
+            Regex("^(?:padho|sunao) (?:mere )?notifications?$").matches(lower) ||
+            Regex("^(?:मेरे |सभी |नए )?(?:नोटिफिकेशन|नोटिफिकेशन्स|सूचनाएं?) (?:पढ़ो|पढ़ें|पढ़ के सुनाओ|सुनाओ|बताओ)$").matches(cleaned) ||
+            Regex("^(?:माझे |सर्व |नवीन )?(?:नोटिफिकेशन|नोटिफिकेशन्स) (?:वाच|वाचा|सांग|सांगा)$").matches(cleaned)
+        if (isReadAll) {
+            return DirectActionMatch.ToolCall("read_notifications", emptyMap())
+        }
+
+        // 3. App-filtered notification reading (e.g., "WhatsApp notification sunao")
+        val rawAppCandidate = Regex("^(?:read|check|show) (.+?) notifications?$", RegexOption.IGNORE_CASE)
+            .find(cleaned)?.groupValues?.get(1)
+            ?: Regex("^notifications? from (.+)$", RegexOption.IGNORE_CASE)
+                .find(cleaned)?.groupValues?.get(1)
+            ?: Regex("^any (.+?) notifications?$", RegexOption.IGNORE_CASE)
+                .find(cleaned)?.groupValues?.get(1)
+            ?: Regex("^(.+?) (?:ka|ke|ki)? ?notifications? (?:sunao|padho|batao|read karo|check karo)$", RegexOption.IGNORE_CASE)
+                .find(cleaned)?.groupValues?.get(1)
+            ?: Regex("^(.+?) (?:का|के|की) (?:नोटिफिकेशन|नोटिफिकेशन्स) (?:सुनाओ|पढ़ो|पढ़ें|बताओ)$")
+                .find(cleaned)?.groupValues?.get(1)
+            ?: Regex("^(.+?) (?:चा|चे|ची|च|चे) (?:नोटिफिकेशन|नोटिफिकेशन्स) (?:वाच|वाचा|सांग|सांगा)$")
+                .find(cleaned)?.groupValues?.get(1)
+            ?: Regex("^(.+?) (?:नोटिफिकेशन|नोटिफिकेशन्स) (?:सुनाओ|पढ़ो|वाच|वाचा)$")
+                .find(cleaned)?.groupValues?.get(1)
+
+        if (rawAppCandidate != null) {
+            val normalizedApp = normalizeAppTarget(rawAppCandidate)
+            val lowerApp = normalizedApp.lowercase()
+            val excludedWords = setOf(
+                "my", "all", "new", "unread", "the", "latest", "last", "recent",
+                "mere", "meri", "sab", "sabhi", "naye", "nai", "apne",
+                "मेरे", "सभी", "नए", "माझे", "सर्व", "नवीन"
+            )
+            if (lowerApp.isNotBlank() && lowerApp !in excludedWords && !lowerApp.contains("panel") && !lowerApp.contains("shade")) {
+                return DirectActionMatch.ToolCall(
+                    toolName = "read_notifications",
+                    args = mapOf("app" to normalizedApp)
+                )
+            }
+        }
+
+        return null
     }
 
     private fun matchOpenApp(cleaned: String): String? {

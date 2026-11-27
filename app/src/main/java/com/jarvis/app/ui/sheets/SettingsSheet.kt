@@ -87,11 +87,13 @@ fun SettingsSheet(
     val accessibilityEnabled by viewModel.accessibilityEnabled.collectAsStateWithLifecycle()
     val accessibilityConnected by viewModel.accessibilityConnected.collectAsStateWithLifecycle()
     val notificationEnabled by viewModel.notificationAccessEnabled.collectAsStateWithLifecycle()
+    val notificationConnected by viewModel.notificationListenerConnected.collectAsStateWithLifecycle()
     val telemetry by viewModel.telemetryState.collectAsStateWithLifecycle()
 
     var search by remember { mutableStateOf("") }
     var modelSearch by remember(brain.activeProvider) { mutableStateOf("") }
     var pinnedCityInput by remember(brain.pinnedLocation) { mutableStateOf(brain.pinnedLocation) }
+    var excludedNotifAppInput by remember { mutableStateOf("") }
 
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
@@ -532,20 +534,102 @@ fun SettingsSheet(
                                     Text("Hands-free workspace")
                                 }
                             }
+                            val notifStatusText = when {
+                                notificationConnected -> "Connected"
+                                notificationEnabled -> "Enabled but disconnected — reconnect in Notification Access"
+                                else -> "Not Granted"
+                            }
+                            val notifStatusColor = when {
+                                notificationConnected -> hud.success
+                                notificationEnabled -> hud.warning
+                                else -> hud.danger
+                            }
                             Text(
-                                text = "Notification Reader: ${if (notificationEnabled) "Granted" else "Not Granted"}",
+                                text = "Notification Reader: $notifStatusText",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = if (notificationEnabled) hud.success else hud.danger
+                                color = notifStatusColor,
+                                modifier = Modifier.testTag("notification_reader_status_text")
                             )
-                            if (!notificationEnabled) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Allow JARVIS to read notifications",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = hud.textPrimary,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Switch(
+                                    checked = brain.notificationReadingEnabled,
+                                    onCheckedChange = { enabled ->
+                                        viewModel.setNotificationReadingEnabled(enabled)
+                                    },
+                                    modifier = Modifier.testTag("notification_reading_toggle")
+                                )
+                            }
+                            Text(
+                                text = "OTPs, verification codes, PINs, passwords, and secret lock-screen notifications are never read aloud.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = hud.textSecondary
+                            )
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                OutlinedTextField(
+                                    value = excludedNotifAppInput,
+                                    onValueChange = { excludedNotifAppInput = it },
+                                    placeholder = { Text("Exclude app or package (e.g. Banking)") },
+                                    singleLine = true,
+                                    colors = hudTextFieldColors(),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("exclude_notification_app_input")
+                                )
+                                OutlinedButton(
+                                    onClick = {
+                                        if (excludedNotifAppInput.isNotBlank()) {
+                                            viewModel.addExcludedNotificationApp(excludedNotifAppInput)
+                                            excludedNotifAppInput = ""
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .heightIn(min = 48.dp)
+                                        .testTag("exclude_notification_app_button")
+                                ) {
+                                    Text("Exclude")
+                                }
+                            }
+                            if (brain.excludedNotificationPackages.isNotEmpty()) {
+                                Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    brain.excludedNotificationPackages.sorted().forEach { app ->
+                                        FilterChip(
+                                            selected = true,
+                                            onClick = { viewModel.removeExcludedNotificationApp(app) },
+                                            label = { Text("$app ×") },
+                                            colors = hudFilterChipColors(),
+                                            modifier = Modifier.testTag("excluded_notification_chip_$app")
+                                        )
+                                    }
+                                }
+                            }
+                            if (!notificationConnected) {
                                 Button(
                                     onClick = { viewModel.openNotificationListenerSettings() },
-                                    colors = ButtonDefaults.buttonColors(containerColor = hud.accent, contentColor = hud.background)
+                                    colors = ButtonDefaults.buttonColors(containerColor = hud.accent, contentColor = hud.background),
+                                    modifier = Modifier.testTag("open_notification_settings_button")
                                 ) {
                                     Text("Open Notification Settings")
                                 }
                             } else {
-                                OutlinedButton(onClick = { viewModel.openNotificationListenerSettings() }) {
+                                OutlinedButton(
+                                    onClick = { viewModel.openNotificationListenerSettings() },
+                                    modifier = Modifier.testTag("open_notification_settings_button")
+                                ) {
                                     Text("Open Notification Settings")
                                 }
                             }

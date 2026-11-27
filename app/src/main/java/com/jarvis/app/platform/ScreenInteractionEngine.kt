@@ -168,25 +168,33 @@ object SensitiveUiActionPolicy {
         "com.google.android.permissioncontroller"
     )
 
+    private val strictAutoSensitiveInputPackages = setOf(
+        "android",
+        "com.android.packageinstaller",
+        "com.google.android.packageinstaller",
+        "com.android.permissioncontroller",
+        "com.google.android.permissioncontroller"
+    )
+
     private val permissionPackageActionPattern = Regex(
         "\\b(allow|grant|accept|install|uninstall|continue|ok|always|while\\s+using|only\\s+this\\s+time|delete|remove|force\\s+stop|disable|clear\\s+storage|clear\\s+data|activate|trust)\\b"
     )
 
     private val sensitiveActionPatterns = listOf(
-        // Send / outbound messaging / email
-        Regex("\\b(send|reply|forward|dispatch|transmit|deliver|mail|email)\\b"),
+        // Send / outbound messaging / email / phone calls
+        Regex("\\b(send|reply|forward|dispatch|transmit|deliver|mail|email|place\\s+call|make\\s+call|dial)\\b"),
         // Submit / finalize / checkout
         Regex("\\b(submit|confirm|place\\s+order|checkout|check\\s+out|complete\\s+order|save\\s+changes)\\b"),
-        // Publish / post / broadcast
-        Regex("\\b(publish|post|tweet|repost|broadcast|upload|go\\s+live)\\b"),
+        // Publish / post / broadcast / share externally
+        Regex("\\b(publish|post|tweet|repost|broadcast|upload|go\\s+live|share\\s+with)\\b"),
         // Pay / purchase / financial
         Regex("\\b(pay|payment|purchase|buy|subscribe|donate|transfer|withdraw|deposit|billing|upi)\\b"),
-        // Delete / erase / wipe / deactivate / force stop / clear storage
-        Regex("\\b(delete|remove|erase|wipe|destroy|purge|clear\\s+(?:all|data|history|cache|storage|account)|deactivate|close\\s+account|force\\s+stop)\\b"),
+        // Delete / erase / wipe / format / deactivate / force stop / clear storage
+        Regex("\\b(delete|remove|erase|wipe|destroy|purge|format\\s+(?:sd|storage|card|usb|drive|device|data)|clear\\s+(?:all|data|history|cache|storage|account)|deactivate|close\\s+account|force\\s+stop)\\b"),
         // Uninstall / install
         Regex("\\b(uninstall|install|sideload)\\b"),
-        // Grant permissions / system privileges
-        Regex("\\b(allow|grant|permit|permission|permissions|authorize|always\\s+allow|while\\s+using|only\\s+this\\s+time|enable\\s+accessibility)\\b"),
+        // Grant permissions / system privileges / disable security protections
+        Regex("\\b(allow|grant|permit|permission|permissions|authorize|always\\s+allow|while\\s+using|only\\s+this\\s+time|enable\\s+accessibility|disable\\s+(?:play\\s+protect|security|protection|firewall|defender|antivirus|lock|pin|password|2fa))\\b"),
         // Account / security / privacy settings
         Regex("\\b(account|accounts|password|passcode|pin|biometric|fingerprint|face\\s+unlock|2fa|two[- ]factor|mfa|security|privacy|sign\\s+out|log\\s+out|logout|revoke|disconnect|device\\s+admin|factory\\s+reset|reset\\s+phone|reset\\s+network)\\b")
     )
@@ -292,7 +300,7 @@ object SensitiveUiActionPolicy {
         screenActionLabels: List<String> = emptyList()
     ): Boolean {
         val normalizedPackage = packageName.lowercase(Locale.ROOT)
-        if (normalizedPackage in permissionOrInstallerPackages) {
+        if (normalizedPackage in strictAutoSensitiveInputPackages) {
             return true
         }
         val normalizedFields = fields

@@ -193,7 +193,7 @@ class DeviceCapabilityRegistry(
         val a11yConnected = JarvisAccessibilityService.isConnectedNow()
 
         val notifEnabled = runCatching { JarvisNotificationListener.isEnabled(appContext) }.getOrDefault(false)
-        val notifConnected = JarvisNotificationListener.instance != null
+        val notifConnected = JarvisNotificationListener.isConnectedNow()
 
         val recordAudioGranted = ContextCompat.checkSelfPermission(
             appContext,

@@ -25,63 +25,229 @@ data class NotificationItem(
     val postTime: Long
 )
 
+data class NotificationReadBatch(
+    val connected: Boolean,
+    val items: List<NotificationItem> = emptyList(),
+    val hiddenSensitiveCount: Int = 0,
+    val excludedCount: Int = 0
+)
+
+object NotificationSensitivityFilter {
+    private val explicitKeywordPatterns = listOf(
+        Regex(
+            "\\b(otp|one[ -]?time\\s+(?:password|passcode|pin|code)|verification\\s+code|auth(?:entication)?\\s+code|security\\s+code|login\\s+code|2fa|two[ -]?factor|mfa|passcode|password|pin\\s*(?:code|number)?|mpin|tpin|upi\\s*pin|cvv|cvc|secret\\s+code|secret\\s+key|recovery\\s+code)\\b",
+            RegexOption.IGNORE_CASE
+        ),
+        Regex(
+            "(ओटीपी|पासवर्ड|पिन|वेरिफिकेशन\\s*कोड|सत्यापन\\s*कोड|गोपनीय\\s*कोड)",
+            RegexOption.IGNORE_CASE
+        )
+    )
+
+    private val codeDigitPattern = Regex("\\b\\d{4,8}\\b")
+    private val authContextPattern = Regex(
+        "\\b(code|verify|verification|authenticate|auth|txn|transaction|debit(?:ed)?|credit(?:ed)?|bank|upi|login|sign[ -]?in|valid\\s+for|do\\s+not\\s+share|never\\s+share|use\\s+\\d{4,8}|enter\\s+\\d{4,8})\\b",
+        RegexOption.IGNORE_CASE
+    )
+
+    fun isSensitive(
+        title: String,
+        text: String,
+        subText: String = "",
+        visibility: Int = Notification.VISIBILITY_PRIVATE
+    ): Boolean {
+        if (visibility == Notification.VISIBILITY_SECRET) return true
+        val combined = listOf(title, text, subText)
+            .filter { it.isNotBlank() }
+            .joinToString(" ")
+            .trim()
+        if (combined.isBlank()) return false
+        if (explicitKeywordPatterns.any { it.containsMatchIn(combined) }) return true
+        if (codeDigitPattern.containsMatchIn(combined) && authContextPattern.containsMatchIn(combined)) {
+            return true
+        }
+        return false
+    }
+}
+
 class JarvisNotificationListener : NotificationListenerService() {
     companion object {
         @Volatile
         var instance: JarvisNotificationListener? = null
 
+        @Volatile
+        var isConnected: Boolean = false
+            private set
+
+        private val _isConnectedState = MutableStateFlow(false)
+        val isConnectedState: StateFlow<Boolean> = _isConnectedState.asStateFlow()
+
+        fun isConnectedNow(): Boolean = isConnected && instance != null
+
         fun isEnabled(context: Context): Boolean =
             NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
+
+        private fun updateConnectionState(service: JarvisNotificationListener?, connected: Boolean) {
+            instance = service
+            isConnected = connected
+            _isConnectedState.value = connected
+        }
+
+        internal fun resetConnectionStateForTest() {
+            activeNotificationsProviderForTest = null
+            updateConnectionState(null, false)
+        }
+
+        @Volatile
+        internal var activeNotificationsProviderForTest: (() -> Array<android.service.notification.StatusBarNotification>?)? = null
     }
 
     override fun onListenerConnected() {
-        instance = this
+        super.onListenerConnected()
+        updateConnectionState(this, true)
     }
 
     override fun onListenerDisconnected() {
-        instance = null
+        updateConnectionState(null, false)
+        super.onListenerDisconnected()
     }
 
-    fun readActiveItems(filterApp: String = "", filterFrom: String = ""): List<NotificationItem> {
+    override fun onDestroy() {
+        updateConnectionState(null, false)
+        super.onDestroy()
+    }
+
+    fun readActiveItems(
+        filterApp: String = "",
+        filterFrom: String = "",
+        excludedPackages: Set<String> = emptySet()
+    ): List<NotificationItem> =
+        readActiveItemsDetailed(
+            filterApp = filterApp,
+            filterFrom = filterFrom,
+            excludedPackages = excludedPackages
+        ).items
+
+    fun readActiveItemsDetailed(
+        filterApp: String = "",
+        filterFrom: String = "",
+        excludedPackages: Set<String> = emptySet()
+    ): NotificationReadBatch {
+        if (!isConnectedNow()) {
+            return NotificationReadBatch(connected = false)
+        }
         val pm = packageManager
-        val list = (activeNotifications ?: emptyArray())
+        val normalizedExclusions = excludedPackages
+            .map { it.trim().lowercase(java.util.Locale.ROOT) }
+            .filter { it.isNotBlank() }
+            .toSet()
+
+        var hiddenSensitiveCount = 0
+        var excludedCount = 0
+        val safeItems = mutableListOf<NotificationItem>()
+
+        val rawActive = activeNotificationsProviderForTest?.invoke() ?: try {
+            activeNotifications
+        } catch (_: Exception) {
+            null
+        }
+        val sortedNotifications = (rawActive ?: emptyArray())
             .filter { sbn ->
                 val n = sbn.notification
                 sbn.packageName != packageName &&
                     !sbn.isOngoing &&
                     (n.flags and Notification.FLAG_GROUP_SUMMARY) == 0
             }
-            .mapNotNull { sbn ->
-                val n = sbn.notification
-                val extras = n.extras
-                val style = NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(n)
-                val title = (style?.conversationTitle ?: extras.getCharSequence(Notification.EXTRA_TITLE))?.toString().orEmpty().trim()
-                val text = if (style != null && style.messages.isNotEmpty()) {
-                    style.messages.takeLast(2).joinToString(" | ") { it.text?.toString().orEmpty() }
-                } else {
-                    (extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
-                        ?: extras.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty().trim()
-                }
-                if (title.isBlank() && text.isBlank()) return@mapNotNull null
-                val app = try {
-                    pm.getApplicationLabel(pm.getApplicationInfo(sbn.packageName, 0)).toString()
-                } catch (_: Exception) {
-                    sbn.packageName
-                }
-                NotificationItem(sbn.key, sbn.packageName, app, title, text, sbn.postTime)
-            }
             .sortedByDescending { it.postTime }
 
-        return list.filter { item ->
-            val okApp = filterApp.isBlank() || item.app.contains(filterApp, ignoreCase = true)
-            val okFrom = filterFrom.isBlank() || item.title.contains(filterFrom, ignoreCase = true)
-            okApp && okFrom
+        for (sbn in sortedNotifications) {
+            val n = sbn.notification
+            val pkgName = sbn.packageName.orEmpty()
+            val app = try {
+                pm.getApplicationLabel(pm.getApplicationInfo(pkgName, 0)).toString()
+            } catch (_: Exception) {
+                pkgName
+            }
+
+            if (isExcludedApp(pkgName, app, normalizedExclusions)) {
+                excludedCount += 1
+                continue
+            }
+
+            val extras = n.extras
+            val style = NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(n)
+            val title = (style?.conversationTitle ?: extras?.getCharSequence(Notification.EXTRA_TITLE))
+                ?.toString().orEmpty().trim()
+            val subText = extras?.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString().orEmpty().trim()
+            val rawText = if (style != null && style.messages.isNotEmpty()) {
+                style.messages.takeLast(2).joinToString(" | ") { it.text?.toString().orEmpty() }
+            } else {
+                (extras?.getCharSequence(Notification.EXTRA_BIG_TEXT)
+                    ?: extras?.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty().trim()
+            }
+
+            if (NotificationSensitivityFilter.isSensitive(title, rawText, subText, n.visibility)) {
+                hiddenSensitiveCount += 1
+                continue
+            }
+
+            if (title.isBlank() && rawText.isBlank()) continue
+
+            val okApp = filterApp.isBlank() ||
+                app.contains(filterApp, ignoreCase = true) ||
+                pkgName.contains(filterApp, ignoreCase = true)
+            val okFrom = filterFrom.isBlank() || title.contains(filterFrom, ignoreCase = true)
+            if (okApp && okFrom) {
+                safeItems.add(
+                    NotificationItem(
+                        key = sbn.key,
+                        pkg = pkgName,
+                        app = app,
+                        title = title,
+                        text = rawText,
+                        postTime = sbn.postTime
+                    )
+                )
+            }
+        }
+
+        return NotificationReadBatch(
+            connected = true,
+            items = safeItems,
+            hiddenSensitiveCount = hiddenSensitiveCount,
+            excludedCount = excludedCount
+        )
+    }
+
+    private fun isExcludedApp(
+        pkg: String,
+        appLabel: String,
+        normalizedExclusions: Set<String>
+    ): Boolean {
+        if (normalizedExclusions.isEmpty()) return false
+        val lowerPkg = pkg.trim().lowercase(java.util.Locale.ROOT)
+        val lowerApp = appLabel.trim().lowercase(java.util.Locale.ROOT)
+        return normalizedExclusions.any { ex ->
+            lowerPkg == ex ||
+                lowerApp == ex ||
+                (ex.length >= 3 && (lowerPkg.contains(".$ex") || lowerApp.contains(ex)))
         }
     }
 }
 
+data class AccessibilityLiveSnapshotState(
+    val connected: Boolean = false,
+    val activePackage: String = "",
+    val lastEventType: Int = 0,
+    val lastEventTimeMs: Long = 0L,
+    val hasAccessibleText: Boolean = false,
+    val latestSnapshot: ScreenSnapshot? = null
+)
+
 class JarvisAccessibilityService : AccessibilityService() {
     companion object {
+        private const val EVENT_REFRESH_THROTTLE_MS = 120L
+
         @Volatile
         var instance: JarvisAccessibilityService? = null
 
@@ -91,6 +257,15 @@ class JarvisAccessibilityService : AccessibilityService() {
 
         private val _isConnectedState = MutableStateFlow(false)
         val isConnectedState: StateFlow<Boolean> = _isConnectedState.asStateFlow()
+
+        private val _liveSnapshotState = MutableStateFlow(AccessibilityLiveSnapshotState())
+        val liveSnapshotState: StateFlow<AccessibilityLiveSnapshotState> = _liveSnapshotState.asStateFlow()
+
+        @Volatile
+        var onLiveSnapshotUpdated: ((ScreenSnapshot) -> Unit)? = null
+
+        @Volatile
+        internal var nowMsProvider: () -> Long = { System.currentTimeMillis() }
 
         fun isConnectedNow(): Boolean = isConnected && instance != null
 
@@ -125,19 +300,88 @@ class JarvisAccessibilityService : AccessibilityService() {
             instance = service
             isConnected = connected
             _isConnectedState.value = connected
+            if (!connected) {
+                _liveSnapshotState.value = AccessibilityLiveSnapshotState()
+            } else {
+                _liveSnapshotState.value = _liveSnapshotState.value.copy(connected = true)
+            }
         }
 
         internal fun resetConnectionStateForTest() {
+            nowMsProvider = { System.currentTimeMillis() }
+            onLiveSnapshotUpdated = null
             updateConnectionState(null, false)
         }
     }
 
+    @Volatile
+    private var lastEventRefreshMs: Long = 0L
+
+    @Volatile
+    private var lastEventTypeHandled: Int = 0
+
+    @Volatile
+    private var lastEventPackage: String = ""
+
     public override fun onServiceConnected() {
         super.onServiceConnected()
+        lastEventRefreshMs = 0L
+        lastEventTypeHandled = 0
+        lastEventPackage = ""
         updateConnectionState(this, true)
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (!isConnectedNow() || event == null) return
+        val eventType = event.eventType
+        val isRelevant = eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+            eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED
+        if (!isRelevant) return
+
+        val now = nowMsProvider()
+        val eventPkg = try {
+            event.packageName?.toString().orEmpty().trim()
+        } catch (_: Exception) {
+            ""
+        }
+        val packageChanged = eventPkg.isNotBlank() && !eventPkg.equals(lastEventPackage, ignoreCase = true)
+        val withinThrottle = (now - lastEventRefreshMs) in 0L until EVENT_REFRESH_THROTTLE_MS
+        if (withinThrottle &&
+            !packageChanged &&
+            eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            eventType == lastEventTypeHandled
+        ) {
+            return
+        }
+
+        lastEventRefreshMs = now
+        lastEventTypeHandled = eventType
+        if (eventPkg.isNotBlank()) {
+            lastEventPackage = eventPkg
+        }
+
+        val result = ScreenReaderEngine(
+            windowSource = createWindowSource(),
+            maxAttempts = 1,
+            retryDelayMs = 0L,
+            nowMs = nowMsProvider
+        ).readScreenImmediate()
+
+        if (result is ScreenReadResult.Success) {
+            val snapshot = result.snapshot
+            _liveSnapshotState.value = AccessibilityLiveSnapshotState(
+                connected = true,
+                activePackage = snapshot.packageName,
+                lastEventType = eventType,
+                lastEventTimeMs = now,
+                hasAccessibleText = snapshot.hasReadableText(),
+                latestSnapshot = snapshot
+            )
+            onLiveSnapshotUpdated?.invoke(snapshot)
+        }
+    }
 
     override fun onInterrupt() = Unit
 

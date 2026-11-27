@@ -238,6 +238,9 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     private val _notificationAccessEnabled = MutableStateFlow(false)
     val notificationAccessEnabled: StateFlow<Boolean> = _notificationAccessEnabled.asStateFlow()
 
+    private val _notificationListenerConnected = MutableStateFlow(JarvisNotificationListener.isConnectedNow())
+    val notificationListenerConnected: StateFlow<Boolean> = _notificationListenerConnected.asStateFlow()
+
     private val _qrResultBitmap = MutableStateFlow<Bitmap?>(null)
     val qrResultBitmap: StateFlow<Bitmap?> = _qrResultBitmap.asStateFlow()
 
@@ -300,6 +303,9 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
                 RoutineAlarms.syncRoutines(context, list)
             }
         }
+        JarvisAccessibilityService.onLiveSnapshotUpdated = { snapshot ->
+            toolExecutor.conversationContextManager.recordScreenSnapshot(snapshot)
+        }
         runtimeScope.launch {
             JarvisAccessibilityService.isConnectedState.collect { connected ->
                 val activeConn = connected && JarvisAccessibilityService.instance != null
@@ -309,6 +315,17 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
                 }
                 _accessibilityEnabled.value = try {
                     JarvisAccessibilityService.isEnabled(context)
+                } catch (_: Exception) {
+                    false
+                }
+                capabilityRegistry.refresh(voiceController.isTtsReady())
+            }
+        }
+        runtimeScope.launch {
+            JarvisNotificationListener.isConnectedState.collect { connected ->
+                _notificationListenerConnected.value = connected && JarvisNotificationListener.instance != null
+                _notificationAccessEnabled.value = try {
+                    JarvisNotificationListener.isEnabled(context)
                 } catch (_: Exception) {
                     false
                 }
@@ -427,6 +444,8 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     internal fun getRapidTempFailureCountForTest(): Int = consecutiveRapidTempFailures
     internal fun getSilenceFailureCountForTest(): Int = consecutiveSilenceFailures
     internal fun getTempFailureRetryCountForTest(): Int = consecutiveTempFailureRetries
+    internal fun getConversationContextManagerForTest() = toolExecutor.conversationContextManager
+    internal fun getTaskContextStoreForTest() = toolExecutor.taskContextStore
 
     fun hasRecordAudioPermission(): Boolean =
         ContextCompat.checkSelfPermission(
@@ -474,6 +493,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         } catch (_: Exception) {
             false
         }
+        _notificationListenerConnected.value = JarvisNotificationListener.isConnectedNow()
         capabilityRegistry.refresh(voiceController.isTtsReady())
     }
 
@@ -1689,6 +1709,33 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         val cfg = brainConfig.value
         runtimeScope.launch {
             remotePcClient.sendRemoteInput(cfg.pcHost, cfg.pcPort, action, x, y, text)
+        }
+    }
+
+    fun setNotificationReadingEnabled(enabled: Boolean) {
+        updateBrain { it.copy(notificationReadingEnabled = enabled) }
+    }
+
+    fun addExcludedNotificationApp(appOrPackage: String) {
+        val cleaned = appOrPackage.trim()
+        if (cleaned.isBlank()) return
+        updateBrain { cur ->
+            val updated = cur.excludedNotificationPackages
+                .filterNot { it.equals(cleaned, ignoreCase = true) }
+                .toMutableSet()
+            updated.add(cleaned)
+            cur.copy(excludedNotificationPackages = updated)
+        }
+    }
+
+    fun removeExcludedNotificationApp(appOrPackage: String) {
+        val cleaned = appOrPackage.trim()
+        updateBrain { cur ->
+            cur.copy(
+                excludedNotificationPackages = cur.excludedNotificationPackages
+                    .filterNot { it.equals(cleaned, ignoreCase = true) }
+                    .toSet()
+            )
         }
     }
 

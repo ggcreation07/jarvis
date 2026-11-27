@@ -179,6 +179,7 @@ class LocalDeviceCommandEngine(
             else -> null
         }
         "read_screen" -> DeviceActionId.SCREEN_READ
+        "read_notifications" -> DeviceActionId.READ_NOTIFICATIONS
         "find_ui_element" -> DeviceActionId.UI_FIND
         "click_ui_element" -> DeviceActionId.UI_CLICK
         "type_text" -> DeviceActionId.UI_TYPE_TEXT

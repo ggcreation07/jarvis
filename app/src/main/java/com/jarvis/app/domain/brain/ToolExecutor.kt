@@ -114,16 +114,25 @@ class ToolExecutor(
         val callResult = when (result) {
             is ScreenReadResult.Success -> {
                 val payloadText = result.snapshot.toUntrustedDataBlock()
+                val hasAccessibleText = result.snapshot.hasReadableText()
+                val readableCount = result.snapshot.readableTextCount()
+                val summaryText = if (hasAccessibleText) {
+                    payloadText
+                } else {
+                    "Screen attached (${result.snapshot.packageName}), but this window exposes no accessible text (${result.snapshot.nodes.size} UI node(s), none with readable text).\n$payloadText"
+                }
                 ToolCallExecutionResult(
                     toolName = "read_screen",
                     ok = true,
-                    summary = payloadText,
+                    summary = summaryText,
                     payload = buildJsonObject {
                         put("status", "ok")
                         put("trust", result.snapshot.trustLevel)
                         put("untrusted", true)
                         put("package_name", result.snapshot.packageName)
                         put("node_count", result.snapshot.nodes.size)
+                        put("has_accessible_text", hasAccessibleText)
+                        put("readable_text_count", readableCount)
                         put("max_depth_reached", result.snapshot.maxDepthReached)
                         put("truncated", result.snapshot.truncated)
                         put("data", payloadText)
@@ -620,7 +629,8 @@ class ToolExecutor(
                 }
             }
         }
-        if (ToolConfirmationPolicy.requiresConfirmation(normalizedName, effectiveArgs)) {
+        val riskAssessment = ToolConfirmationPolicy.assessRisk(normalizedName, effectiveArgs)
+        if (riskAssessment.requiresConfirmation) {
             val binding = ActionBindingKey(
                 toolName = normalizedName,
                 canonicalArgs = ToolConfirmationPolicy.canonicalizeArgs(normalizedName, effectiveArgs)
@@ -656,8 +666,8 @@ class ToolExecutor(
             }
             if (blockedSummary != null) {
                 conversationContextManager.syncTaskAndConfirmation(taskContextStore, getPendingConfirmation())
-                repository.logAction(normalizedName, "Confirmation required: $blockedDescription", false)
-                return confirmationRequired(normalizedName, blockedId, blockedDescription, blockedSummary)
+                repository.logAction(normalizedName, "Confirmation required (${riskAssessment.level.name}): $blockedDescription", false)
+                return confirmationRequired(normalizedName, blockedId, blockedDescription, blockedSummary, riskAssessment)
             }
         } else {
             synchronized(confirmationLock) {
@@ -887,14 +897,93 @@ class ToolExecutor(
                 if (outcome.ok) ok("play_media", outcome.summary) else fail("play_media", outcome.summary)
             }
             "read_notifications" -> {
-                val app = strArg(args, "app")
-                val listener = JarvisNotificationListener.instance
-                if (listener == null) {
-                    fail("read_notifications", "Notification access isn't enabled yet. Enable JARVIS Notification Reader in Android Settings.")
+                val cfg = configStore.getBrainConfigOnce()
+                if (!cfg.notificationReadingEnabled) {
+                    ToolCallExecutionResult(
+                        toolName = "read_notifications",
+                        ok = false,
+                        summary = "Notification reading is currently disabled in JARVIS Settings.",
+                        payload = buildJsonObject {
+                            put("status", "failed")
+                            put("error_code", "NOTIFICATION_READING_DISABLED")
+                        }
+                    )
+                } else if (!JarvisNotificationListener.isConnectedNow()) {
+                    val enabledInSettings = appContext?.let { JarvisNotificationListener.isEnabled(it) } ?: false
+                    val msg = if (enabledInSettings) {
+                        "JARVIS Notification Reader is enabled in Android Settings, but not connected yet. Open Notification Access settings to reconnect it."
+                    } else {
+                        "Notification access isn't enabled yet. Enable JARVIS Notification Reader in Android Settings."
+                    }
+                    ToolCallExecutionResult(
+                        toolName = "read_notifications",
+                        ok = false,
+                        summary = msg,
+                        payload = buildJsonObject {
+                            put("status", "failed")
+                            put("error_code", if (enabledInSettings) "SERVICE_ENABLED_BUT_DISCONNECTED" else "PERMISSION_DENIED")
+                            put("settings_action", Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                        }
+                    )
                 } else {
-                    val items = listener.readActiveItems(filterApp = app)
-                    if (items.isEmpty()) ok("read_notifications", "No unread notifications right now.")
-                    else ok("read_notifications", "Active notifications:\n" + items.take(8).joinToString("\n") { "• [${it.app}] ${it.title}: ${it.text}" })
+                    val listener = JarvisNotificationListener.instance!!
+                    val app = strArg(args, "app").ifBlank { strArg(args, "package") }
+                    val from = strArg(args, "from")
+                    val latestOnly = (args["latest_only"] as? JsonPrimitive)?.booleanOrNull
+                        ?: strArg(args, "latest_only").equals("true", ignoreCase = true)
+                    val limit = (intArg(args, "limit") ?: if (latestOnly) 1 else 6).coerceIn(1, 8)
+                    val batch = listener.readActiveItemsDetailed(
+                        filterApp = app,
+                        filterFrom = from,
+                        excludedPackages = cfg.excludedNotificationPackages
+                    )
+                    val selected = batch.items.take(limit)
+                    val hiddenNote = if (batch.hiddenSensitiveCount > 0) {
+                        " (${batch.hiddenSensitiveCount} sensitive/OTP notification(s) skipped for privacy.)"
+                    } else {
+                        ""
+                    }
+                    val summaryText = when {
+                        selected.isEmpty() && batch.hiddenSensitiveCount > 0 ->
+                            "No non-sensitive notifications to read right now. Skipped ${batch.hiddenSensitiveCount} OTP, PIN, or sensitive notification(s) for privacy."
+                        selected.isEmpty() && batch.excludedCount > 0 && app.isNotBlank() ->
+                            "Notifications from $app are excluded in JARVIS Settings."
+                        selected.isEmpty() && app.isNotBlank() ->
+                            "No matching notifications from $app right now."
+                        selected.isEmpty() ->
+                            "No unread notifications right now."
+                        latestOnly -> {
+                            val item = selected.first()
+                            val cleanTitle = ScreenReaderEngine.sanitizeUntrustedField(item.title, 80)
+                            val cleanBody = ScreenReaderEngine.sanitizeUntrustedField(item.text, 160)
+                            val header = if (cleanTitle.isNotBlank()) "${item.app} ($cleanTitle)" else item.app
+                            if (cleanBody.isNotBlank()) {
+                                "Latest notification is from $header: $cleanBody$hiddenNote"
+                            } else {
+                                "Latest notification is from $header.$hiddenNote"
+                            }
+                        }
+                        else -> {
+                            val lines = selected.joinToString("\n") { item ->
+                                val cleanTitle = ScreenReaderEngine.sanitizeUntrustedField(item.title, 80)
+                                val cleanBody = ScreenReaderEngine.sanitizeUntrustedField(item.text, 160)
+                                "• [${item.app}] ${cleanTitle.ifBlank { "Notification" }}: ${cleanBody.ifBlank { "(no preview text)" }}"
+                            }
+                            "Active notifications:\n$lines$hiddenNote"
+                        }
+                    }
+                    ToolCallExecutionResult(
+                        toolName = "read_notifications",
+                        ok = true,
+                        summary = summaryText,
+                        payload = buildJsonObject {
+                            put("status", "ok")
+                            put("notification_count", selected.size)
+                            put("hidden_sensitive_count", batch.hiddenSensitiveCount)
+                            put("excluded_count", batch.excludedCount)
+                            put("latest_only", latestOnly)
+                        }
+                    )
                 }
             }
             "read_clipboard" -> {
@@ -1226,13 +1315,23 @@ class ToolExecutor(
             else -> fail(toolName, "Unknown tool: $toolName")
         }
 
-        val auditSummary = if (result.toolName == "find_ui_element") {
-            val pkg = result.payload["package_name"]?.jsonPrimitive?.content.orEmpty()
-            val matches = result.payload["match_count"]?.jsonPrimitive?.content.orEmpty()
-            val code = result.payload["result_code"]?.jsonPrimitive?.content.orEmpty()
-            "Searched external UI ($pkg, matches=$matches, status=$code)"
-        } else {
-            result.summary
+        val auditSummary = when (result.toolName) {
+            "find_ui_element" -> {
+                val pkg = result.payload["package_name"]?.jsonPrimitive?.content.orEmpty()
+                val matches = result.payload["match_count"]?.jsonPrimitive?.content.orEmpty()
+                val code = result.payload["result_code"]?.jsonPrimitive?.content.orEmpty()
+                "Searched external UI ($pkg, matches=$matches, status=$code)"
+            }
+            "read_notifications" -> {
+                if (result.ok) {
+                    val count = result.payload["notification_count"]?.jsonPrimitive?.content ?: "0"
+                    val hidden = result.payload["hidden_sensitive_count"]?.jsonPrimitive?.content ?: "0"
+                    "Read active notifications on demand ($count shown, $hidden sensitive skipped)"
+                } else {
+                    result.summary
+                }
+            }
+            else -> result.summary
         }
         recordContextAfterToolExecution(normalizedName, effectiveArgs, result, auditSummary)
         repository.logAction(result.toolName, auditSummary, result.ok)
@@ -1327,7 +1426,8 @@ class ToolExecutor(
         tool: String,
         pendingId: String,
         description: String,
-        summary: String
+        summary: String,
+        riskAssessment: ActionRiskAssessment
     ) = ToolCallExecutionResult(
         toolName = tool,
         ok = false,
@@ -1337,6 +1437,8 @@ class ToolExecutor(
             put("requires_confirmation", true)
             put("pending_id", pendingId)
             put("action", description)
+            put("risk_level", riskAssessment.level.name)
+            put("risk_category", riskAssessment.category)
         }
     )
 }

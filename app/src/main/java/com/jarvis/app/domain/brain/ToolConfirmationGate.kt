@@ -60,73 +60,11 @@ object ToolConfirmationPolicy {
     private fun rawStrArg(args: Map<String, JsonElement>, key: String): String =
         (args[key] as? JsonPrimitive)?.content.orEmpty()
 
-    fun requiresConfirmation(toolName: String, args: Map<String, JsonElement>): Boolean {
-        val normalized = toolName.trim()
-        return when (normalized) {
-            "forget_fact" -> {
-                val query = strArg(args, "text").lowercase(Locale.ROOT)
-                query == "everything" || query == "all" || query == "*" ||
-                    query.startsWith("all ") || query.startsWith("every ") ||
-                    query.contains("everything") || query.contains("all facts") ||
-                    query.contains("all memory") || query.contains("wipe memory")
-            }
-            "manage_schedule" -> {
-                val action = strArg(args, "action").ifBlank { "get" }.lowercase(Locale.ROOT)
-                action == "clear" || action == "delete" || action == "remove"
-            }
-            "control_interface" -> {
-                val action = strArg(args, "action").lowercase(Locale.ROOT)
-                action == "clear_chat" || action == "delete_chat"
-            }
-            "customize_screen" -> {
-                strArg(args, "action").equals("reset", ignoreCase = true)
-            }
-            "device_control" -> {
-                strArg(args, "action").equals("dnd_on", ignoreCase = true)
-            }
-            "delete_file" -> true
-            "uninstall_app", "uninstall_application" -> true
-            "open_application" -> {
-                val name = strArg(args, "name").lowercase(Locale.ROOT)
-                name.startsWith("uninstall ") || name.startsWith("delete ")
-            }
-            "send_message", "compose_message" -> true
-            "pc_task" -> {
-                val goal = strArg(args, "goal")
-                val kind = strArg(args, "kind").ifBlank { "browser" }
-                isHighImpactPcTask(goal, kind)
-            }
-            "click_ui_element" -> {
-                if (strArg(args, "_requires_confirmation").equals("true", ignoreCase = true)) {
-                    true
-                } else {
-                    com.jarvis.app.platform.SensitiveUiActionPolicy.isSensitiveText(
-                        strArg(args, "text"),
-                        strArg(args, "content_description"),
-                        strArg(args, "hint"),
-                        strArg(args, "view_id"),
-                        strArg(args, "_resolved_label"),
-                        packageName = strArg(args, "_bound_package").ifBlank { strArg(args, "expected_package") }
-                    )
-                }
-            }
-            "type_text" -> {
-                if (strArg(args, "_requires_confirmation").equals("true", ignoreCase = true)) {
-                    true
-                } else {
-                    com.jarvis.app.platform.SensitiveUiActionPolicy.isSensitiveInputText(
-                        strArg(args, "target_text"),
-                        strArg(args, "content_description"),
-                        strArg(args, "hint"),
-                        strArg(args, "view_id"),
-                        strArg(args, "_resolved_label"),
-                        packageName = strArg(args, "_bound_package").ifBlank { strArg(args, "expected_package") }
-                    )
-                }
-            }
-            else -> false
-        }
-    }
+    fun assessRisk(toolName: String, args: Map<String, JsonElement>): ActionRiskAssessment =
+        ActionRiskPolicy.assess(toolName, args)
+
+    fun requiresConfirmation(toolName: String, args: Map<String, JsonElement>): Boolean =
+        ActionRiskPolicy.assess(toolName, args).requiresConfirmation
 
     fun isHighImpactPcTask(goal: String, kind: String): Boolean {
         val normalized = "${goal.trim()} ${kind.trim()}".lowercase(Locale.ROOT)

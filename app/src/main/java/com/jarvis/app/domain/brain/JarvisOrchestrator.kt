@@ -50,6 +50,7 @@ class JarvisOrchestrator(
 ) {
     private val localEngine = LocalDeviceCommandEngine(toolExecutor, capabilityRegistry)
     private val followUpEngine = LocalFollowUpEngine(toolExecutor, capabilityRegistry)
+    private val languageDetectionManager = LanguageDetectionManager()
 
     fun parseAgentMention(rawText: String, fallbackAgentId: String): Pair<String, String> {
         val trimmed = rawText.trim()
@@ -72,6 +73,13 @@ class JarvisOrchestrator(
         isVoiceTurn: Boolean = false
     ): Flow<TurnProgressEvent> = channelFlow {
         val (agentId, cleanInput) = parseAgentMention(rawUserInput, brainConfig.selectedAgentId)
+        val detectedLang = languageDetectionManager.detect(
+            rawInput = cleanInput,
+            recentHistory = history,
+            preferredLanguage = brainConfig.preferredLanguage,
+            autoDetect = brainConfig.autoLanguageDetectionEnabled
+        ).language
+        toolExecutor.conversationContextManager.recordDetectedLanguage(detectedLang)
         val safeObjective = TaskContextSanitizer.sanitizeSummaryText(cleanInput).take(120)
         send(TurnProgressEvent.AgentSelected(agentId))
 
@@ -426,6 +434,20 @@ class JarvisOrchestrator(
                     return@channelFlow
                 }
                 is LocalFollowUpOutcome.Executed -> {
+                    val shouldAdaptPhase6e = !ctxOutcome.awaitingConfirmation && (
+                        ctxOutcome.toolName == "read_notifications" ||
+                            ctxOutcome.summary.contains("exposes no accessible text", ignoreCase = true)
+                        )
+                    val adaptedSummary = if (shouldAdaptPhase6e) {
+                        NaturalLanguageReplyAdapter.adapt(
+                            summary = ctxOutcome.summary,
+                            targetLanguage = detectedLang,
+                            userInput = cleanInput,
+                            matchSpeakingStyle = brainConfig.matchSpeakingStyleEnabled
+                        )
+                    } else {
+                        ctxOutcome.summary
+                    }
                     val act = ToolActivityItem(
                         id = "act_${System.currentTimeMillis()}",
                         toolName = ctxOutcome.toolName,
@@ -435,7 +457,7 @@ class JarvisOrchestrator(
                             ctxOutcome.awaitingConfirmation -> "awaiting_confirmation"
                             else -> "failed"
                         },
-                        summary = ctxOutcome.summary
+                        summary = adaptedSummary
                     )
                     activities.add(act)
                     send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
@@ -454,12 +476,12 @@ class JarvisOrchestrator(
                             },
                             agentId = agentId,
                             stepsCount = 1,
-                            summary = ctxOutcome.summary.take(160)
+                            summary = adaptedSummary.take(160)
                         )
                     )
                     send(
                         TurnProgressEvent.Finished(
-                            replyText = ctxOutcome.summary,
+                            replyText = adaptedSummary,
                             agentId = agentId,
                             activities = activities.toList(),
                             isError = !ctxOutcome.ok && !ctxOutcome.awaitingConfirmation
@@ -681,13 +703,27 @@ class JarvisOrchestrator(
                 val execRes = localEngine.executeMatch(localMatch) { effect ->
                     send(TurnProgressEvent.SideEffect(effect))
                 }
+                val shouldAdaptPhase6e = !execRes.awaitingConfirmation && (
+                    actName == "read_notifications" ||
+                        execRes.summary.contains("exposes no accessible text", ignoreCase = true)
+                    )
+                val adaptedSummary = if (shouldAdaptPhase6e) {
+                    NaturalLanguageReplyAdapter.adapt(
+                        summary = execRes.summary,
+                        targetLanguage = detectedLang,
+                        userInput = cleanInput,
+                        matchSpeakingStyle = brainConfig.matchSpeakingStyleEnabled
+                    )
+                } else {
+                    execRes.summary
+                }
                 activities[0] = activities[0].copy(
                     status = when {
                         execRes.ok -> "succeeded"
                         execRes.awaitingConfirmation -> "awaiting_confirmation"
                         else -> "failed"
                     },
-                    summary = execRes.summary
+                    summary = adaptedSummary
                 )
                 send(TurnProgressEvent.ToolActivitiesUpdated(activities.toList()))
                 repository.upsertTaskRecord(
@@ -701,12 +737,12 @@ class JarvisOrchestrator(
                         },
                         agentId = agentId,
                         stepsCount = 1,
-                        summary = execRes.summary
+                        summary = adaptedSummary
                     )
                 )
                 send(
                     TurnProgressEvent.Finished(
-                        replyText = execRes.summary,
+                        replyText = adaptedSummary,
                         agentId = agentId,
                         activities = activities.toList(),
                         isError = !execRes.ok && !execRes.awaitingConfirmation

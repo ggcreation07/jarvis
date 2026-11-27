@@ -53,6 +53,16 @@ data class ScreenSnapshot(
     fun isSystemDialog(): Boolean = ScreenReadinessDetector.isSystemDialog(this)
     fun isPermissionScreen(): Boolean = ScreenReadinessDetector.isPermissionScreen(this)
 
+    fun readableTextCount(): Int = nodes.count { node ->
+        !node.isPassword && (
+            (node.text.isNotBlank() && node.text != ScreenReaderEngine.PASSWORD_MASK) ||
+                (node.contentDescription.isNotBlank() && node.contentDescription != ScreenReaderEngine.PASSWORD_MASK) ||
+                (node.hintText.isNotBlank() && node.hintText != ScreenReaderEngine.PASSWORD_MASK)
+            )
+    }
+
+    fun hasReadableText(): Boolean = readableTextCount() > 0
+
     /**
      * Serializes captured screen nodes inside an explicit untrusted-data boundary so callers never
      * interpret on-screen text as assistant instructions.
@@ -230,6 +240,8 @@ class ScreenReaderEngine(
             attempts = attempts
         )
     }
+
+    internal fun readScreenImmediate(): ScreenReadResult = readSingleAttempt(1)
 
     suspend fun waitForReadyScreen(
         config: UiWaitConfig = UiWaitConfig(),

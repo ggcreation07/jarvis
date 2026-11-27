@@ -149,7 +149,9 @@ data class BrainConfig(
     val preferredLanguage: String = "auto",
     val selectedVoiceName: String = "",
     val allowVoiceFallbackWithApproval: Boolean = false,
-    val elevenLabsVoiceId: String = ""
+    val elevenLabsVoiceId: String = "",
+    val notificationReadingEnabled: Boolean = true,
+    val excludedNotificationPackages: Set<String> = emptySet()
 )
 
 @Immutable

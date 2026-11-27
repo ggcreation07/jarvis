@@ -84,6 +84,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     val accessibilityEnabled: StateFlow<Boolean> get() = runtime.accessibilityEnabled
     val accessibilityConnected: StateFlow<Boolean> get() = runtime.accessibilityConnected
     val notificationAccessEnabled: StateFlow<Boolean> get() = runtime.notificationAccessEnabled
+    val notificationListenerConnected: StateFlow<Boolean> get() = runtime.notificationListenerConnected
     val qrResultBitmap: StateFlow<Bitmap?> get() = runtime.qrResultBitmap
     val clipboardPreview: StateFlow<String> get() = runtime.clipboardPreview
     val remoteConnectionStatus: StateFlow<String> get() = runtime.remoteConnectionStatus
@@ -238,6 +239,15 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
 
     fun sendRemoteDesktopInput(action: String, x: Int? = null, y: Int? = null, text: String? = null) =
         runtime.sendRemoteDesktopInput(action, x, y, text)
+
+    fun setNotificationReadingEnabled(enabled: Boolean) =
+        runtime.setNotificationReadingEnabled(enabled)
+
+    fun addExcludedNotificationApp(appOrPackage: String) =
+        runtime.addExcludedNotificationApp(appOrPackage)
+
+    fun removeExcludedNotificationApp(appOrPackage: String) =
+        runtime.removeExcludedNotificationApp(appOrPackage)
 
     fun openAndroidSettings(action: String) = runtime.openAndroidSettings(action)
 

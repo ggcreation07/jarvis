@@ -189,7 +189,7 @@ class MainActivity : ComponentActivity() {
                                     requestMicAndStartInAppVoiceMode()
                                 }
                             },
-                            onHideKeepSession = { viewModel.stopAssistantSession() },
+                            onHideKeepSession = { viewModel.hideVoiceOnlyUiKeepSession() },
                             onStopAssistant = { viewModel.stopAssistantSession() }
                         )
                     } else {

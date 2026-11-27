@@ -55,6 +55,14 @@ class VoiceSelectionManager {
         )
     }
 
+    fun isExplicitMaleVoice(voice: Voice): Boolean {
+        val nameLower = voice.name.lowercase(Locale.ROOT)
+        val features = runCatching { voice.features }.getOrNull().orEmpty().map { it.lowercase(Locale.ROOT) }
+        if (features.any { it.contains("male") || it == "gender=male" }) return true
+        if (KNOWN_MALE_INDICATORS.any { nameLower.contains(it) }) return true
+        return false
+    }
+
     fun isMaleVoice(voice: Voice): Boolean {
         val nameLower = voice.name.lowercase(Locale.ROOT)
         val features = runCatching { voice.features }.getOrNull().orEmpty().map { it.lowercase(Locale.ROOT) }
@@ -66,16 +74,8 @@ class VoiceSelectionManager {
             return false
         }
 
-        // If explicitly male
-        if (features.any { it.contains("male") || it == "gender=male" }) {
-            return true
-        }
-
-        if (KNOWN_MALE_INDICATORS.any { nameLower.contains(it) }) {
-            return true
-        }
-
-        return false
+        // Accept explicit male or neutral/unspecified voices
+        return true
     }
 
     fun getAvailableMaleVoices(tts: TextToSpeech?): List<AvailableVoiceInfo> {
@@ -131,10 +131,11 @@ class VoiceSelectionManager {
             }
         }
 
-        // 2. Search for direct locale matching male voice
+        // 2. Search for direct locale matching male voice (explicit male first, then offline & quality)
         val directMatches = maleVoices.filter { isLocaleMatch(it.locale, targetLocale) }
             .sortedWith(
-                compareByDescending<Voice> { !it.isNetworkConnectionRequired }
+                compareByDescending<Voice> { isExplicitMaleVoice(it) }
+                    .thenByDescending { !it.isNetworkConnectionRequired }
                     .thenByDescending { it.quality }
                     .thenBy { it.latency }
             )
@@ -143,13 +144,31 @@ class VoiceSelectionManager {
             return VoiceSelectionOutcome.Selected(directMatches.first())
         }
 
+        // 2B. Search for same-language male voice across regional variants (e.g. en-US / en-GB for English)
+        val sameLanguageMatches = maleVoices.filter {
+            it.locale.language.equals(targetLocale.language, ignoreCase = true)
+        }.sortedWith(
+            compareByDescending<Voice> { isExplicitMaleVoice(it) }
+                .thenByDescending { !it.isNetworkConnectionRequired }
+                .thenByDescending { it.quality }
+                .thenBy { it.latency }
+        )
+        if (sameLanguageMatches.isNotEmpty()) {
+            val chosen = sameLanguageMatches.first()
+            return VoiceSelectionOutcome.Selected(
+                voice = chosen,
+                isFallback = true,
+                fallbackReason = "Using ${chosen.locale.toLanguageTag()} male voice for ${targetLanguage.displayName}."
+            )
+        }
+
         // 3. Language-specific matching:
         // For Hinglish, if no Hindi male voice exists, look for Indian English male voice
         if (targetLanguage == UserLanguage.HINGLISH) {
-            val inEnglishMale = maleVoices.firstOrNull {
+            val inEnglishMale = maleVoices.filter {
                 it.locale.language.equals("en", ignoreCase = true) &&
                     it.locale.country.equals("IN", ignoreCase = true)
-            }
+            }.sortedByDescending { isExplicitMaleVoice(it) }.firstOrNull()
             if (inEnglishMale != null) {
                 return VoiceSelectionOutcome.Selected(
                     voice = inEnglishMale,

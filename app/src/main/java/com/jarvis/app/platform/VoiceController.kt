@@ -15,12 +15,15 @@ import android.media.audiofx.NoiseSuppressor
 import android.media.audiofx.Visualizer
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.jarvis.app.domain.brain.LanguageDetectionManager
 import com.jarvis.app.domain.brain.UserLanguage
@@ -112,6 +115,14 @@ internal fun computePcm16RmsNormalized(buffer: ShortArray, readCount: Int): Floa
     return sqrt(sumSq / count).toFloat().coerceIn(0f, 1f)
 }
 
+enum class VoiceControllerState {
+    IDLE,
+    LISTENING,
+    PROCESSING,
+    SPEAKING,
+    STOPPED
+}
+
 enum class RecognitionFailureKind {
     SILENCE_OR_EMPTY,
     RECOGNIZER_BUSY,
@@ -129,11 +140,33 @@ data class RecognitionFailure(
 
 class VoiceController(private val context: Context) {
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
+    private data class RecognitionSession(
+        val sessionId: Long,
+        val startedAtMs: Long,
+        val onFinalResult: (String) -> Unit,
+        val onFailure: (String) -> Unit,
+        val onRecognitionFailure: ((RecognitionFailure) -> Unit)?,
+        var hasReadyForSpeech: Boolean = false,
+        var hasBegunSpeech: Boolean = false,
+        var hasEndedSpeech: Boolean = false,
+        var stopRequested: Boolean = false,
+        var terminated: Boolean = false
+    )
+
     private var speechRecognizer: SpeechRecognizer? = null
-    private var activeRecognitionListenerForTest: RecognitionListener? = null
+    private var listenerAttachedToRecognizer: Boolean = false
+    private var activeSession: RecognitionSession? = null
+    private var pendingSessionStart: Boolean = false
+    private var nextSessionId: Long = 0L
+
     private var listenAttemptCountForTest: Int = 0
+    private var recognizerCreationCountForTest: Int = 0
+    private var recognizerCancelCountForTest: Int = 0
+    private val transitionLogs = mutableListOf<String>()
+
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var ttsAudioSessionId: Int = AudioManager.AUDIO_SESSION_ID_GENERATE
@@ -154,12 +187,6 @@ class VoiceController(private val context: Context) {
     @Volatile
     private var pendingBargeInCallback: (() -> Unit)? = null
 
-    @Volatile
-    private var isListeningRequested: Boolean = false
-
-    @Volatile
-    private var activeRecognitionSessionId: Long = 0L
-
     private val bargeInLock = Any()
     private var bargeInMonitorJob: Job? = null
     private var activeAudioRecord: AudioRecord? = null
@@ -172,6 +199,9 @@ class VoiceController(private val context: Context) {
 
     @Volatile
     private var fallbackTargetLevel = 0.25f
+
+    private val _voiceState = MutableStateFlow(VoiceControllerState.IDLE)
+    val voiceState: StateFlow<VoiceControllerState> = _voiceState.asStateFlow()
 
     private val _isListening = MutableStateFlow(false)
     val isListening: StateFlow<Boolean> = _isListening.asStateFlow()
@@ -202,6 +232,38 @@ class VoiceController(private val context: Context) {
 
     val voiceSelectionManager = VoiceSelectionManager()
     val languageDetectionManager = LanguageDetectionManager()
+
+    private inline fun runOnMain(crossinline block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post { block() }
+        }
+    }
+
+    private fun logEvent(message: String) {
+        synchronized(transitionLogs) {
+            if (transitionLogs.size >= MAX_TRANSITION_LOGS) {
+                transitionLogs.removeAt(0)
+            }
+            transitionLogs.add(message)
+        }
+        runCatching { Log.d(TAG, message) }
+    }
+
+    private fun transitionTo(newState: VoiceControllerState, reason: String) {
+        val prev = _voiceState.value
+        if (prev != newState) {
+            _voiceState.value = newState
+            _isListening.value = (newState == VoiceControllerState.LISTENING)
+            _isSpeaking.value = (newState == VoiceControllerState.SPEAKING)
+            logEvent("STATE $prev -> $newState (reason=$reason)")
+        } else {
+            _isListening.value = (newState == VoiceControllerState.LISTENING)
+            _isSpeaking.value = (newState == VoiceControllerState.SPEAKING)
+            logEvent("STATE $prev (kept, reason=$reason)")
+        }
+    }
 
     fun getAvailableMaleVoices(): List<AvailableVoiceInfo> =
         voiceSelectionManager.getAvailableMaleVoices(tts)
@@ -257,7 +319,7 @@ class VoiceController(private val context: Context) {
         activeUtteranceId = null
         activeUtteranceGroupPrefix = null
         pendingBargeInCallback = null
-        finishSpeakingState()
+        finishSpeakingState(reason = "tts_error(utt=$current, interrupted=$wasInterrupted)")
         if (!wasInterrupted) {
             _voiceError.value = "Voice playback error."
             _ttsSpeechFailures.tryEmit(current)
@@ -280,17 +342,18 @@ class VoiceController(private val context: Context) {
                     ttsReady = true
                     tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) {
-                            val current = activeUtteranceId
-                            if (current == null || !isMatchingActiveUtterance(utteranceId) || utteranceInterruptedOrStopped) {
-                                return
-                            }
-                            val wasAlreadySpeaking = _isSpeaking.value
-                            _isSpeaking.value = true
-                            if (!wasAlreadySpeaking) {
-                                scope.launch { startSpeakingMetering() }
-                                val bargeInCallback = pendingBargeInCallback
-                                if (bargeInCallback != null) {
-                                    scope.launch {
+                            runOnMain {
+                                val current = activeUtteranceId
+                                if (current == null || !isMatchingActiveUtterance(utteranceId) || utteranceInterruptedOrStopped) {
+                                    logEvent("TTS_IGNORED onStart(utt=$utteranceId, active=$current)")
+                                    return@runOnMain
+                                }
+                                val wasAlreadyMetering = (_voiceState.value == VoiceControllerState.SPEAKING && fallbackMeterJob != null)
+                                transitionTo(VoiceControllerState.SPEAKING, "tts_onStart(utt=$utteranceId)")
+                                if (!wasAlreadyMetering) {
+                                    startSpeakingMetering()
+                                    val bargeInCallback = pendingBargeInCallback
+                                    if (bargeInCallback != null) {
                                         startBargeInMonitor(current, bargeInCallback)
                                     }
                                 }
@@ -298,47 +361,56 @@ class VoiceController(private val context: Context) {
                         }
 
                         override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
-                            if (activeUtteranceId == null || !isMatchingActiveUtterance(utteranceId) || utteranceInterruptedOrStopped) {
-                                return
-                            }
-                            if (!hasReceivedRealVisualizerEnergy) {
-                                val span = (end - start).coerceIn(1, 16)
-                                fallbackTargetLevel = (0.34f + (span / 16f) * 0.44f).coerceIn(0.32f, 0.82f)
+                            runOnMain {
+                                if (activeUtteranceId == null || !isMatchingActiveUtterance(utteranceId) || utteranceInterruptedOrStopped) {
+                                    return@runOnMain
+                                }
+                                if (!hasReceivedRealVisualizerEnergy) {
+                                    val span = (end - start).coerceIn(1, 16)
+                                    fallbackTargetLevel = (0.34f + (span / 16f) * 0.44f).coerceIn(0.32f, 0.82f)
+                                }
                             }
                         }
 
                         override fun onDone(utteranceId: String?) {
-                            val current = activeUtteranceId
-                            if (current == null || !isFinalActiveUtterance(utteranceId)) {
-                                return
-                            }
-                            val wasInterrupted = utteranceInterruptedOrStopped
-                            activeUtteranceId = null
-                            activeUtteranceGroupPrefix = null
-                            pendingBargeInCallback = null
-                            finishSpeakingState()
-                            if (!wasInterrupted) {
-                                _ttsNaturalCompletions.tryEmit(current)
+                            runOnMain {
+                                val current = activeUtteranceId
+                                if (current == null || !isFinalActiveUtterance(utteranceId)) {
+                                    logEvent("TTS_IGNORED onDone(utt=$utteranceId, active=$current)")
+                                    return@runOnMain
+                                }
+                                val wasInterrupted = utteranceInterruptedOrStopped
+                                activeUtteranceId = null
+                                activeUtteranceGroupPrefix = null
+                                pendingBargeInCallback = null
+                                finishSpeakingState(reason = "tts_onDone(utt=$current, interrupted=$wasInterrupted)")
+                                if (!wasInterrupted) {
+                                    _ttsNaturalCompletions.tryEmit(current)
+                                }
                             }
                         }
 
                         override fun onStop(utteranceId: String?, interrupted: Boolean) {
-                            if (activeUtteranceId == null || !isMatchingActiveUtterance(utteranceId)) {
-                                return
+                            runOnMain {
+                                val current = activeUtteranceId
+                                if (current == null || !isMatchingActiveUtterance(utteranceId)) {
+                                    logEvent("TTS_IGNORED onStop(utt=$utteranceId, active=$current)")
+                                    return@runOnMain
+                                }
+                                activeUtteranceId = null
+                                activeUtteranceGroupPrefix = null
+                                pendingBargeInCallback = null
+                                finishSpeakingState(reason = "tts_onStop(utt=$utteranceId, interrupted=$interrupted)")
                             }
-                            activeUtteranceId = null
-                            activeUtteranceGroupPrefix = null
-                            pendingBargeInCallback = null
-                            finishSpeakingState()
                         }
 
                         override fun onError(utteranceId: String?, errorCode: Int) {
-                            handleUtteranceError(utteranceId)
+                            runOnMain { handleUtteranceError(utteranceId) }
                         }
 
                         @Deprecated("Deprecated in Java")
                         override fun onError(utteranceId: String?) {
-                            handleUtteranceError(utteranceId)
+                            runOnMain { handleUtteranceError(utteranceId) }
                         }
                     })
                 } else {
@@ -448,11 +520,13 @@ class VoiceController(private val context: Context) {
         _isRealSpeakingMeteringActive.value = false
     }
 
-    private fun finishSpeakingState() {
-        _isSpeaking.value = false
+    private fun finishSpeakingState(reason: String = "tts_finished") {
         _speakingLevel.value = 0f
         abandonTtsAudioFocus()
-        scope.launch { stopSpeakingMeteringOnly() }
+        stopSpeakingMeteringOnly()
+        if (_voiceState.value == VoiceControllerState.SPEAKING) {
+            transitionTo(VoiceControllerState.IDLE, reason)
+        }
     }
 
     private fun requestTtsAudioFocus() {
@@ -623,7 +697,11 @@ class VoiceController(private val context: Context) {
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
 
-    fun isListeningOrPending(): Boolean = _isListening.value || isListeningRequested
+    fun isListeningOrPending(): Boolean =
+        _voiceState.value == VoiceControllerState.LISTENING ||
+            _voiceState.value == VoiceControllerState.PROCESSING ||
+            pendingSessionStart ||
+            (activeSession != null && activeSession?.terminated == false && activeSession?.stopRequested == false)
 
     fun isTtsReady(): Boolean = ttsReady
 
@@ -639,186 +717,364 @@ class VoiceController(private val context: Context) {
         }
     }
 
-    fun startListening(
-        onFinalResult: (String) -> Unit,
-        onFailure: (String) -> Unit,
-        onRecognitionFailure: ((RecognitionFailure) -> Unit)? = null
-    ) {
-        if (!hasRecordAudioPermission()) {
-            val msg = "Microphone permission needed."
-            _voiceError.value = msg
-            onFailure(msg)
-            onRecognitionFailure?.invoke(
-                RecognitionFailure(
-                    kind = RecognitionFailureKind.PERMISSION_DENIED,
-                    errorCode = SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS,
-                    message = msg,
-                    sessionDurationMs = 0L
-                )
-            )
-            return
-        }
-        if (!isSpeechRecognitionAvailable()) {
-            val msg = "Speech recognition is unavailable on this device."
-            _voiceError.value = msg
-            onFailure(msg)
-            onRecognitionFailure?.invoke(
-                RecognitionFailure(
-                    kind = RecognitionFailureKind.UNAVAILABLE,
-                    errorCode = null,
-                    message = msg,
-                    sessionDurationMs = 0L
-                )
-            )
-            return
-        }
-        if (isListeningOrPending()) {
-            return
-        }
-
-        isListeningRequested = true
-        activeRecognitionSessionId += 1L
-        val sessionId = activeRecognitionSessionId
-
-        val monitorJob = stopBargeInMonitor()
-        if (_isSpeaking.value || activeUtteranceId != null) {
-            stopSpeaking()
-        }
-        _voiceError.value = null
-        _partialTranscript.value = ""
-
-        if (monitorJob != null && monitorJob.isActive) {
-            scope.launch(Dispatchers.Main.immediate) {
-                withTimeoutOrNull(250L) { monitorJob.join() }
-                if (sessionId == activeRecognitionSessionId && isListeningRequested) {
-                    beginSpeechRecognizerSession(sessionId, onFinalResult, onFailure, onRecognitionFailure)
-                }
+    fun resumeFromStopped(reason: String = "explicit_resume") {
+        runOnMain {
+            if (_voiceState.value == VoiceControllerState.STOPPED) {
+                transitionTo(VoiceControllerState.IDLE, reason)
             }
-        } else {
-            beginSpeechRecognizerSession(sessionId, onFinalResult, onFailure, onRecognitionFailure)
         }
     }
 
-    private fun destroyRecognizerSafely(cancelFirst: Boolean = false) {
+    fun markProcessingFinished(reason: String = "processing_finished") {
+        runOnMain {
+            if (_voiceState.value == VoiceControllerState.PROCESSING && activeSession == null && !pendingSessionStart) {
+                transitionTo(VoiceControllerState.IDLE, reason)
+            }
+        }
+    }
+
+    fun stopSession(reason: String = "explicit_stop") {
+        runOnMain {
+            logEvent("STOP_SESSION reason=$reason state=${_voiceState.value}")
+            pendingSessionStart = false
+            val session = activeSession
+            if (session != null && !session.terminated) {
+                session.terminated = true
+                activeSession = null
+                cancelRecognizerIntentionally(reason = "stopSession:$reason")
+            } else {
+                activeSession = null
+            }
+            _audioLevel.value = 0f
+            _partialTranscript.value = ""
+            stopSpeakingInternal(reason = "stopSession:$reason", interruptedByBargeIn = true, targetState = VoiceControllerState.STOPPED)
+            transitionTo(VoiceControllerState.STOPPED, reason)
+        }
+    }
+
+    fun startListening(
+        onFinalResult: (String) -> Unit,
+        onFailure: (String) -> Unit,
+        onRecognitionFailure: ((RecognitionFailure) -> Unit)? = null,
+        isAutoRestart: Boolean = false
+    ) {
+        runOnMain {
+            if (isAutoRestart && _voiceState.value == VoiceControllerState.STOPPED) {
+                logEvent("START_LISTENING_BLOCKED reason=session_stopped_no_auto_restart")
+                return@runOnMain
+            }
+
+            if (!hasRecordAudioPermission()) {
+                val msg = "Microphone permission needed."
+                _voiceError.value = msg
+                transitionTo(VoiceControllerState.STOPPED, "permission_denied")
+                onFailure(msg)
+                onRecognitionFailure?.invoke(
+                    RecognitionFailure(
+                        kind = RecognitionFailureKind.PERMISSION_DENIED,
+                        errorCode = SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS,
+                        message = msg,
+                        sessionDurationMs = 0L
+                    )
+                )
+                return@runOnMain
+            }
+            if (!isSpeechRecognitionAvailable()) {
+                val msg = "Speech recognition is unavailable on this device."
+                _voiceError.value = msg
+                transitionTo(VoiceControllerState.STOPPED, "recognizer_unavailable")
+                onFailure(msg)
+                onRecognitionFailure?.invoke(
+                    RecognitionFailure(
+                        kind = RecognitionFailureKind.UNAVAILABLE,
+                        errorCode = null,
+                        message = msg,
+                        sessionDurationMs = 0L
+                    )
+                )
+                return@runOnMain
+            }
+
+            val currentState = _voiceState.value
+            val currentSession = activeSession
+            if (currentState == VoiceControllerState.LISTENING ||
+                currentState == VoiceControllerState.PROCESSING ||
+                pendingSessionStart ||
+                (currentSession != null && !currentSession.terminated && !currentSession.stopRequested)
+            ) {
+                logEvent(
+                    "START_LISTENING_IGNORED_DUPLICATE state=$currentState pending=$pendingSessionStart activeSession=${currentSession?.sessionId}"
+                )
+                return@runOnMain
+            }
+
+            // If a prior stopListening() left a terminating session open without results yet, cancel it before starting fresh.
+            if (currentSession != null && currentSession.stopRequested && !currentSession.terminated) {
+                currentSession.terminated = true
+                activeSession = null
+                cancelRecognizerIntentionally(reason = "replace_stopped_session")
+            }
+
+            if (currentState == VoiceControllerState.SPEAKING || _isSpeaking.value || activeUtteranceId != null) {
+                stopSpeakingInternal(
+                    reason = "startListening_interrupt",
+                    interruptedByBargeIn = true,
+                    targetState = VoiceControllerState.IDLE
+                )
+            }
+
+            if (_voiceState.value == VoiceControllerState.STOPPED) {
+                transitionTo(VoiceControllerState.IDLE, "explicit_user_restart")
+            }
+
+            nextSessionId += 1L
+            val session = RecognitionSession(
+                sessionId = nextSessionId,
+                startedAtMs = System.currentTimeMillis(),
+                onFinalResult = onFinalResult,
+                onFailure = onFailure,
+                onRecognitionFailure = onRecognitionFailure
+            )
+            activeSession = session
+            pendingSessionStart = true
+            _voiceError.value = null
+            _partialTranscript.value = ""
+            transitionTo(VoiceControllerState.LISTENING, "startListening(session=${session.sessionId}, autoRestart=$isAutoRestart)")
+
+            val monitorJob = stopBargeInMonitor()
+            if (monitorJob != null && monitorJob.isActive) {
+                scope.launch(Dispatchers.Main.immediate) {
+                    withTimeoutOrNull(250L) { monitorJob.join() }
+                    if (activeSession === session && !session.terminated && _voiceState.value == VoiceControllerState.LISTENING) {
+                        beginSpeechRecognizerSession(session)
+                    } else {
+                        pendingSessionStart = false
+                        logEvent("START_LISTENING_ABORTED_AFTER_BARGE_JOIN session=${session.sessionId} state=${_voiceState.value}")
+                    }
+                }
+            } else {
+                beginSpeechRecognizerSession(session)
+            }
+        }
+    }
+
+    private val masterRecognitionListener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {
+            runOnMain {
+                val session = activeSession
+                if (session == null || session.terminated || _voiceState.value == VoiceControllerState.STOPPED) {
+                    logEvent("CALLBACK_IGNORED onReadyForSpeech (session=${session?.sessionId}, state=${_voiceState.value})")
+                    return@runOnMain
+                }
+                session.hasReadyForSpeech = true
+                transitionTo(VoiceControllerState.LISTENING, "onReadyForSpeech(session=${session.sessionId})")
+            }
+        }
+
+        override fun onBeginningOfSpeech() {
+            runOnMain {
+                val session = activeSession
+                if (session == null || session.terminated || _voiceState.value == VoiceControllerState.STOPPED) {
+                    logEvent("CALLBACK_IGNORED onBeginningOfSpeech (session=${session?.sessionId}, state=${_voiceState.value})")
+                    return@runOnMain
+                }
+                session.hasBegunSpeech = true
+                transitionTo(VoiceControllerState.LISTENING, "onBeginningOfSpeech(session=${session.sessionId})")
+            }
+        }
+
+        override fun onRmsChanged(rmsdB: Float) {
+            runOnMain {
+                val session = activeSession
+                if (session == null || session.terminated || _voiceState.value != VoiceControllerState.LISTENING) return@runOnMain
+                val normalized = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
+                _audioLevel.value = normalized
+            }
+        }
+
+        override fun onBufferReceived(buffer: ByteArray?) = Unit
+
+        override fun onEndOfSpeech() {
+            runOnMain {
+                val session = activeSession
+                if (session == null || session.terminated || session.hasEndedSpeech || _voiceState.value == VoiceControllerState.STOPPED) {
+                    logEvent(
+                        "CALLBACK_IGNORED onEndOfSpeech (session=${session?.sessionId}, ended=${session?.hasEndedSpeech}, state=${_voiceState.value})"
+                    )
+                    return@runOnMain
+                }
+                session.hasEndedSpeech = true
+                _audioLevel.value = 0f
+                transitionTo(VoiceControllerState.PROCESSING, "onEndOfSpeech(session=${session.sessionId})")
+            }
+        }
+
+        override fun onError(error: Int) {
+            runOnMain {
+                val session = activeSession
+                if (session == null || session.terminated) {
+                    logEvent("CALLBACK_IGNORED onError($error) (no active or already terminated session, state=${_voiceState.value})")
+                    return@runOnMain
+                }
+                session.terminated = true
+                activeSession = null
+                pendingSessionStart = false
+                _audioLevel.value = 0f
+
+                val durationMs = (System.currentTimeMillis() - session.startedAtMs).coerceAtLeast(0L)
+                val (kind, msg) = classifyRecognitionError(error)
+
+                // Do NOT call speechRecognizer.cancel() on every callback or timeout.
+                // Only recycle the single-owner recognizer if Android reports BUSY or CLIENT wedge.
+                if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
+                    logEvent("RECOGNIZER_RECYCLE reason=onError($error) session=${session.sessionId}")
+                    destroyRecognizerSafely(cancelFirst = false, reason = "onError_wedge_$error")
+                } else {
+                    logEvent("SESSION_ENDED_ON_ERROR code=$error kind=$kind session=${session.sessionId} durationMs=$durationMs")
+                }
+
+                if (_voiceState.value == VoiceControllerState.STOPPED) {
+                    logEvent("CALLBACK_POST_STOP_IGNORED onError($error) session=${session.sessionId}")
+                    return@runOnMain
+                }
+
+                if (kind == RecognitionFailureKind.PERMISSION_DENIED ||
+                    kind == RecognitionFailureKind.UNAVAILABLE
+                ) {
+                    _voiceError.value = msg
+                    transitionTo(VoiceControllerState.STOPPED, "onError_unrecoverable_$error")
+                } else {
+                    _voiceError.value = if (kind == RecognitionFailureKind.SILENCE_OR_EMPTY) null else msg
+                    transitionTo(VoiceControllerState.IDLE, "onError_recoverable_$error")
+                }
+
+                session.onFailure(msg)
+                session.onRecognitionFailure?.invoke(
+                    RecognitionFailure(
+                        kind = kind,
+                        errorCode = error,
+                        message = msg,
+                        sessionDurationMs = durationMs
+                    )
+                )
+            }
+        }
+
+        override fun onResults(results: Bundle?) {
+            runOnMain {
+                val session = activeSession
+                if (session == null || session.terminated) {
+                    logEvent("CALLBACK_IGNORED onResults (no active or already terminated session, state=${_voiceState.value})")
+                    return@runOnMain
+                }
+                session.terminated = true
+                activeSession = null
+                pendingSessionStart = false
+                _audioLevel.value = 0f
+
+                val durationMs = (System.currentTimeMillis() - session.startedAtMs).coerceAtLeast(0L)
+                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()
+                    ?.trim()
+                    .orEmpty()
+                _partialTranscript.value = ""
+
+                if (_voiceState.value == VoiceControllerState.STOPPED) {
+                    logEvent("CALLBACK_POST_STOP_IGNORED onResults session=${session.sessionId}")
+                    return@runOnMain
+                }
+
+                if (text.isNotEmpty()) {
+                    transitionTo(
+                        VoiceControllerState.PROCESSING,
+                        "onResults_valid(session=${session.sessionId}, chars=${text.length})"
+                    )
+                    session.onFinalResult(text)
+                } else {
+                    transitionTo(VoiceControllerState.IDLE, "onResults_empty(session=${session.sessionId})")
+                    val msg = "Didn't catch anything."
+                    session.onFailure(msg)
+                    session.onRecognitionFailure?.invoke(
+                        RecognitionFailure(
+                            kind = RecognitionFailureKind.SILENCE_OR_EMPTY,
+                            errorCode = null,
+                            message = msg,
+                            sessionDurationMs = durationMs
+                        )
+                    )
+                }
+            }
+        }
+
+        override fun onPartialResults(partialResults: Bundle?) {
+            runOnMain {
+                val session = activeSession
+                if (session == null || session.terminated || _voiceState.value == VoiceControllerState.STOPPED) {
+                    return@runOnMain
+                }
+                val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()
+                    .orEmpty()
+                if (partial.isNotBlank()) {
+                    _partialTranscript.value = partial
+                }
+            }
+        }
+
+        override fun onEvent(eventType: Int, params: Bundle?) = Unit
+    }
+
+    private fun ensureRecognizer(): SpeechRecognizer {
+        val existing = speechRecognizer
+        if (existing != null) {
+            if (!listenerAttachedToRecognizer) {
+                existing.setRecognitionListener(masterRecognitionListener)
+                listenerAttachedToRecognizer = true
+            }
+            return existing
+        }
+        recognizerCreationCountForTest += 1
+        logEvent("RECOGNIZER_CREATE count=$recognizerCreationCountForTest")
+        return SpeechRecognizer.createSpeechRecognizer(context).also { created ->
+            speechRecognizer = created
+            created.setRecognitionListener(masterRecognitionListener)
+            listenerAttachedToRecognizer = true
+        }
+    }
+
+    private fun cancelRecognizerIntentionally(reason: String) {
+        val rec = speechRecognizer ?: return
+        recognizerCancelCountForTest += 1
+        logEvent("RECOGNIZER_CANCEL reason=$reason cancelCount=$recognizerCancelCountForTest")
+        runCatching { rec.cancel() }
+    }
+
+    private fun destroyRecognizerSafely(cancelFirst: Boolean = false, reason: String = "unspecified") {
         val old = speechRecognizer
         speechRecognizer = null
-        activeRecognitionListenerForTest = null
+        listenerAttachedToRecognizer = false
         if (old != null) {
+            logEvent("RECOGNIZER_DESTROY reason=$reason cancelFirst=$cancelFirst")
             if (cancelFirst) {
+                recognizerCancelCountForTest += 1
                 runCatching { old.cancel() }
             }
             runCatching { old.destroy() }
         }
     }
 
-    private fun beginSpeechRecognizerSession(
-        sessionId: Long,
-        onFinalResult: (String) -> Unit,
-        onFailure: (String) -> Unit,
-        onRecognitionFailure: ((RecognitionFailure) -> Unit)?
-    ) {
-        if (sessionId != activeRecognitionSessionId || !isListeningRequested) return
+    private fun beginSpeechRecognizerSession(session: RecognitionSession) {
+        if (activeSession !== session || session.terminated || _voiceState.value == VoiceControllerState.STOPPED) {
+            pendingSessionStart = false
+            return
+        }
+        pendingSessionStart = false
         listenAttemptCountForTest += 1
-        val sessionStartMs = System.currentTimeMillis()
-        var sessionTerminated = false
         try {
-            destroyRecognizerSafely(cancelFirst = false)
-            val listener = object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {
-                    if (sessionTerminated || sessionId != activeRecognitionSessionId) return
-                    _isListening.value = true
-                }
-
-                override fun onBeginningOfSpeech() {
-                    if (sessionTerminated || sessionId != activeRecognitionSessionId) return
-                    _isListening.value = true
-                }
-
-                override fun onRmsChanged(rmsdB: Float) {
-                    if (sessionTerminated || sessionId != activeRecognitionSessionId) return
-                    val normalized = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
-                    _audioLevel.value = normalized
-                }
-
-                override fun onBufferReceived(buffer: ByteArray?) = Unit
-
-                override fun onEndOfSpeech() {
-                    if (sessionTerminated || sessionId != activeRecognitionSessionId) return
-                    _isListening.value = false
-                    _audioLevel.value = 0f
-                }
-
-                override fun onError(error: Int) {
-                    if (sessionTerminated || sessionId != activeRecognitionSessionId) return
-                    sessionTerminated = true
-                    activeRecognitionSessionId += 1L
-                    isListeningRequested = false
-                    _isListening.value = false
-                    _audioLevel.value = 0f
-                    val durationMs = (System.currentTimeMillis() - sessionStartMs).coerceAtLeast(0L)
-                    destroyRecognizerSafely(cancelFirst = error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY)
-                    val (kind, msg) = classifyRecognitionError(error)
-                    _voiceError.value = if (kind == RecognitionFailureKind.SILENCE_OR_EMPTY) null else msg
-                    onFailure(msg)
-                    onRecognitionFailure?.invoke(
-                        RecognitionFailure(
-                            kind = kind,
-                            errorCode = error,
-                            message = msg,
-                            sessionDurationMs = durationMs
-                        )
-                    )
-                }
-
-                override fun onResults(results: Bundle?) {
-                    if (sessionTerminated || sessionId != activeRecognitionSessionId) return
-                    sessionTerminated = true
-                    activeRecognitionSessionId += 1L
-                    isListeningRequested = false
-                    _isListening.value = false
-                    _audioLevel.value = 0f
-                    val durationMs = (System.currentTimeMillis() - sessionStartMs).coerceAtLeast(0L)
-                    val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        ?.firstOrNull()
-                        ?.trim()
-                        .orEmpty()
-                    _partialTranscript.value = ""
-                    destroyRecognizerSafely(cancelFirst = false)
-                    if (text.isNotEmpty()) {
-                        onFinalResult(text)
-                    } else {
-                        val msg = "Didn't catch anything."
-                        onFailure(msg)
-                        onRecognitionFailure?.invoke(
-                            RecognitionFailure(
-                                kind = RecognitionFailureKind.SILENCE_OR_EMPTY,
-                                errorCode = null,
-                                message = msg,
-                                sessionDurationMs = durationMs
-                            )
-                        )
-                    }
-                }
-
-                override fun onPartialResults(partialResults: Bundle?) {
-                    if (sessionTerminated || sessionId != activeRecognitionSessionId) return
-                    val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        ?.firstOrNull()
-                        .orEmpty()
-                    if (partial.isNotBlank()) {
-                        _partialTranscript.value = partial
-                    }
-                }
-
-                override fun onEvent(eventType: Int, params: Bundle?) = Unit
-            }
-            activeRecognitionListenerForTest = listener
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
-                setRecognitionListener(listener)
-            }
-
+            val recognizer = ensureRecognizer()
+            val activeLangTag = languageDetectionManager.getActiveLanguage().ttsLocale.toLanguageTag()
             val primaryLanguageTag = Locale.getDefault().toLanguageTag().ifBlank { "en-IN" }
-            val supportedLanguages = listOf(primaryLanguageTag, "en-IN", "hi-IN", "mr-IN", "en-US")
+            val supportedLanguages = listOf(primaryLanguageTag, activeLangTag, "en-IN", "hi-IN", "mr-IN", "en-US")
                 .distinct()
                 .toTypedArray()
 
@@ -828,19 +1084,20 @@ class VoiceController(private val context: Context) {
                 putExtra(RecognizerIntent.EXTRA_SUPPORTED_LANGUAGES, supportedLanguages)
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 2000L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
             }
-            speechRecognizer?.startListening(intent)
+            logEvent("RECOGNIZER_START_LISTENING session=${session.sessionId} attempt=$listenAttemptCountForTest")
+            recognizer.startListening(intent)
         } catch (e: Exception) {
-            if (sessionId != activeRecognitionSessionId) return
-            sessionTerminated = true
-            activeRecognitionSessionId += 1L
-            isListeningRequested = false
-            _isListening.value = false
+            if (activeSession !== session || session.terminated) return
+            session.terminated = true
+            activeSession = null
+            pendingSessionStart = false
             _audioLevel.value = 0f
-            destroyRecognizerSafely(cancelFirst = true)
-            val durationMs = (System.currentTimeMillis() - sessionStartMs).coerceAtLeast(0L)
+            destroyRecognizerSafely(cancelFirst = true, reason = "startListening_exception")
+            val durationMs = (System.currentTimeMillis() - session.startedAtMs).coerceAtLeast(0L)
             val msg = e.localizedMessage ?: "Couldn't start microphone."
             val kind = if (!hasRecordAudioPermission()) {
                 RecognitionFailureKind.PERMISSION_DENIED
@@ -848,8 +1105,13 @@ class VoiceController(private val context: Context) {
                 RecognitionFailureKind.TEMPORARY
             }
             _voiceError.value = msg
-            onFailure(msg)
-            onRecognitionFailure?.invoke(
+            if (kind == RecognitionFailureKind.PERMISSION_DENIED) {
+                transitionTo(VoiceControllerState.STOPPED, "startListening_exception_perm_denied")
+            } else {
+                transitionTo(VoiceControllerState.IDLE, "startListening_exception_temp")
+            }
+            session.onFailure(msg)
+            session.onRecognitionFailure?.invoke(
                 RecognitionFailure(
                     kind = kind,
                     errorCode = null,
@@ -881,23 +1143,47 @@ class VoiceController(private val context: Context) {
             RecognitionFailureKind.TEMPORARY to "Voice input error ($error)."
     }
 
-    fun stopListening() {
-        isListeningRequested = false
-        _isListening.value = false
-        _audioLevel.value = 0f
-        try {
-            speechRecognizer?.stopListening()
-        } catch (_: Exception) {
+    fun stopListening(reason: String = "manual_stop_listening") {
+        runOnMain {
+            val session = activeSession
+            pendingSessionStart = false
+            _audioLevel.value = 0f
+            session?.stopRequested = true
+            logEvent("STOP_LISTENING reason=$reason session=${session?.sessionId}")
+            if (_voiceState.value == VoiceControllerState.LISTENING) {
+                transitionTo(VoiceControllerState.IDLE, reason)
+            }
+            runCatching { speechRecognizer?.stopListening() }
         }
     }
 
-    fun cancelListening() {
-        activeRecognitionSessionId += 1L
-        isListeningRequested = false
-        _isListening.value = false
+    fun cancelListening(reason: String = "intentional_cancel", enterStopped: Boolean = false) {
+        runOnMain {
+            cancelListeningInternal(reason = reason, enterStopped = enterStopped)
+        }
+    }
+
+    private fun cancelListeningInternal(reason: String, enterStopped: Boolean) {
+        val session = activeSession
+        val hadActiveOrPending = (session != null && !session.terminated) || pendingSessionStart
+        if (session != null) {
+            session.terminated = true
+        }
+        activeSession = null
+        pendingSessionStart = false
         _audioLevel.value = 0f
         _partialTranscript.value = ""
-        destroyRecognizerSafely(cancelFirst = true)
+        if (hadActiveOrPending) {
+            cancelRecognizerIntentionally(reason = reason)
+        } else {
+            logEvent("CANCEL_LISTENING_NOOP reason=$reason state=${_voiceState.value}")
+        }
+        when {
+            enterStopped -> transitionTo(VoiceControllerState.STOPPED, reason)
+            _voiceState.value == VoiceControllerState.LISTENING ||
+                _voiceState.value == VoiceControllerState.PROCESSING ->
+                transitionTo(VoiceControllerState.IDLE, reason)
+        }
     }
 
     private fun configureTtsForText(
@@ -927,7 +1213,8 @@ class VoiceController(private val context: Context) {
                     ttsInstance.voice = outcome.voice
                     ttsInstance.language = outcome.voice.locale
                     ttsInstance.setSpeechRate(1.02f)
-                    ttsInstance.setPitch(1.0f)
+                    val isExplicit = voiceSelectionManager.isExplicitMaleVoice(outcome.voice)
+                    ttsInstance.setPitch(if (isExplicit) 1.0f else 0.92f)
                 }
                 true
             }
@@ -1025,22 +1312,34 @@ class VoiceController(private val context: Context) {
         brainConfig: BrainConfig? = null,
         onBargeInDetected: (() -> Unit)? = null
     ): Boolean {
-        if (text.isBlank()) return false
+        if (text.isBlank()) {
+            markProcessingFinished("speak_blank_text")
+            return false
+        }
         val ttsInstance = tts
         if (!ttsReady || ttsInstance == null) {
             _voiceError.value = "Text-to-speech is unavailable right now."
+            markProcessingFinished("speak_tts_unavailable")
             return false
         }
         val clean = sanitizeTextForSpeech(text)
         val chunks = splitTextForTtsChunks(clean)
-        if (chunks.isEmpty()) return false
+        if (chunks.isEmpty()) {
+            markProcessingFinished("speak_empty_chunks")
+            return false
+        }
 
-        if (isListeningOrPending()) {
-            cancelListening()
+        // Only cancel recognition if a recognition session is actively open (never during PROCESSING after onResults).
+        if (_voiceState.value == VoiceControllerState.LISTENING ||
+            pendingSessionStart ||
+            (activeSession != null && activeSession?.terminated == false)
+        ) {
+            cancelListeningInternal(reason = "preempt_for_tts", enterStopped = false)
         }
         stopBargeInMonitor()
 
         if (!configureTtsForText(clean, detectedLanguage, brainConfig)) {
+            markProcessingFinished("speak_voice_unavailable")
             return false
         }
 
@@ -1072,21 +1371,43 @@ class VoiceController(private val context: Context) {
                 activeUtteranceId = null
                 activeUtteranceGroupPrefix = null
                 pendingBargeInCallback = null
-                finishSpeakingState()
+                finishSpeakingState(reason = "speak_queue_failed")
+                if (_voiceState.value == VoiceControllerState.PROCESSING) {
+                    transitionTo(VoiceControllerState.IDLE, "speak_queue_failed")
+                }
                 _voiceError.value = "Couldn't play voice response."
                 return false
             }
         }
+        transitionTo(VoiceControllerState.SPEAKING, "speak_queued(utt=$finalUtteranceId, chunks=${chunks.size})")
         return true
     }
 
     fun stopSpeaking(interruptedByBargeIn: Boolean = false) {
+        runOnMain {
+            stopSpeakingInternal(
+                reason = if (interruptedByBargeIn) "stopSpeaking_barge_in" else "stopSpeaking_manual",
+                interruptedByBargeIn = interruptedByBargeIn,
+                targetState = if (_voiceState.value == VoiceControllerState.STOPPED) VoiceControllerState.STOPPED else VoiceControllerState.IDLE
+            )
+        }
+    }
+
+    private fun stopSpeakingInternal(
+        reason: String,
+        interruptedByBargeIn: Boolean,
+        targetState: VoiceControllerState
+    ) {
+        val hadSpeech = activeUtteranceId != null || _voiceState.value == VoiceControllerState.SPEAKING || _isSpeaking.value
         utteranceInterruptedOrStopped = true
         activeUtteranceId = null
         activeUtteranceGroupPrefix = null
         pendingBargeInCallback = null
         stopBargeInMonitor()
-        finishSpeakingState()
+        finishSpeakingState(reason = reason)
+        if (_voiceState.value == VoiceControllerState.SPEAKING || (hadSpeech && targetState == VoiceControllerState.STOPPED)) {
+            transitionTo(targetState, reason)
+        }
         try {
             tts?.stop()
         } catch (_: Exception) {
@@ -1096,24 +1417,28 @@ class VoiceController(private val context: Context) {
     internal fun lastStartedUtteranceId(): String? = lastStartedUtteranceId
 
     internal fun triggerTestUtteranceCompletion(utteranceId: String) {
-        activeUtteranceId = utteranceId
-        activeUtteranceGroupPrefix = null
-        lastStartedUtteranceId = utteranceId
-        utteranceInterruptedOrStopped = false
-        _isSpeaking.value = true
-        activeUtteranceId = null
-        pendingBargeInCallback = null
-        finishSpeakingState()
-        _ttsNaturalCompletions.tryEmit(utteranceId)
+        runOnMain {
+            activeUtteranceId = utteranceId
+            activeUtteranceGroupPrefix = null
+            lastStartedUtteranceId = utteranceId
+            utteranceInterruptedOrStopped = false
+            transitionTo(VoiceControllerState.SPEAKING, "test_utterance_start($utteranceId)")
+            activeUtteranceId = null
+            pendingBargeInCallback = null
+            finishSpeakingState(reason = "test_utterance_done($utteranceId)")
+            _ttsNaturalCompletions.tryEmit(utteranceId)
+        }
     }
 
     internal fun triggerTestUtteranceFailure(utteranceId: String) {
-        activeUtteranceId = utteranceId
-        activeUtteranceGroupPrefix = null
-        lastStartedUtteranceId = utteranceId
-        utteranceInterruptedOrStopped = false
-        _isSpeaking.value = true
-        handleUtteranceError(utteranceId)
+        runOnMain {
+            activeUtteranceId = utteranceId
+            activeUtteranceGroupPrefix = null
+            lastStartedUtteranceId = utteranceId
+            utteranceInterruptedOrStopped = false
+            transitionTo(VoiceControllerState.SPEAKING, "test_utterance_start_fail($utteranceId)")
+            handleUtteranceError(utteranceId)
+        }
     }
 
     internal fun setTtsReadyForTest(ready: Boolean) {
@@ -1121,51 +1446,67 @@ class VoiceController(private val context: Context) {
     }
 
     internal fun simulateUtteranceStartForTest(utteranceId: String) {
-        activeUtteranceId = utteranceId
-        activeUtteranceGroupPrefix = null
-        lastStartedUtteranceId = utteranceId
-        utteranceInterruptedOrStopped = false
-        _isSpeaking.value = true
+        runOnMain {
+            activeUtteranceId = utteranceId
+            activeUtteranceGroupPrefix = null
+            lastStartedUtteranceId = utteranceId
+            utteranceInterruptedOrStopped = false
+            transitionTo(VoiceControllerState.SPEAKING, "test_simulate_utterance_start($utteranceId)")
+        }
     }
 
     internal fun simulateRecognitionReadyForTest() {
-        activeRecognitionListenerForTest?.onReadyForSpeech(Bundle())
+        masterRecognitionListener.onReadyForSpeech(Bundle())
+    }
+
+    internal fun simulateBeginningOfSpeechForTest() {
+        masterRecognitionListener.onBeginningOfSpeech()
+    }
+
+    internal fun simulateEndOfSpeechForTest() {
+        masterRecognitionListener.onEndOfSpeech()
     }
 
     internal fun simulateRecognitionErrorForTest(error: Int) {
-        activeRecognitionListenerForTest?.onError(error)
+        masterRecognitionListener.onError(error)
     }
 
     internal fun simulateRecognitionResultsForTest(results: List<String>) {
         val bundle = Bundle().apply {
             putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, ArrayList(results))
         }
-        activeRecognitionListenerForTest?.onResults(bundle)
+        masterRecognitionListener.onResults(bundle)
     }
 
     internal fun getListenAttemptCountForTest(): Int = listenAttemptCountForTest
+    internal fun getRecognizerCreationCountForTest(): Int = recognizerCreationCountForTest
+    internal fun getRecognizerCancelCountForTest(): Int = recognizerCancelCountForTest
+    internal fun getTransitionLogsForTest(): List<String> = synchronized(transitionLogs) { transitionLogs.toList() }
 
     internal fun resetListenAttemptCountForTest() {
         listenAttemptCountForTest = 0
+        recognizerCreationCountForTest = 0
+        recognizerCancelCountForTest = 0
+        synchronized(transitionLogs) { transitionLogs.clear() }
     }
 
     fun release() {
-        utteranceInterruptedOrStopped = true
-        activeUtteranceId = null
-        activeUtteranceGroupPrefix = null
-        pendingBargeInCallback = null
-        stopBargeInMonitor()
-        stopSpeakingMeteringOnly()
-        abandonTtsAudioFocus()
-        cancelListening()
-        try {
-            tts?.shutdown()
-        } catch (_: Exception) {
+        runOnMain {
+            stopSession(reason = "release")
+            destroyRecognizerSafely(cancelFirst = false, reason = "release")
+            stopSpeakingMeteringOnly()
+            abandonTtsAudioFocus()
+            try {
+                tts?.shutdown()
+            } catch (_: Exception) {
+            }
+            scope.cancel()
         }
-        scope.cancel()
     }
 
     companion object {
+        private const val TAG = "JarvisVoice"
+        private const val MAX_TRANSITION_LOGS = 200
         internal const val MAX_TTS_CHUNK_CHARS = 3500
     }
 }

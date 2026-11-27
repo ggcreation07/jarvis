@@ -154,16 +154,15 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
 
     val hudStatus: StateFlow<HudStatus> = combine(
-        voiceController.isListening,
-        voiceController.isSpeaking,
+        voiceController.voiceState,
         _isBusy,
         _streamingMessage
-    ) { listening, speaking, busy, streaming ->
+    ) { voiceState, busy, streaming ->
         when {
-            listening -> HudStatus.LISTENING
-            speaking -> HudStatus.SPEAKING
+            voiceState == VoiceControllerState.LISTENING -> HudStatus.LISTENING
+            voiceState == VoiceControllerState.SPEAKING -> HudStatus.SPEAKING
             busy && streaming?.toolActivities?.any { it.status == "running" } == true -> HudStatus.WORKING
-            busy -> HudStatus.THINKING
+            busy || voiceState == VoiceControllerState.PROCESSING -> HudStatus.THINKING
             else -> HudStatus.IDLE
         }
     }.stateIn(runtimeScope, SharingStarted.Eagerly, HudStatus.IDLE)
@@ -267,6 +266,8 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
 
     private var consecutiveVoiceErrors: Int = 0
     private var consecutiveRapidTempFailures: Int = 0
+    private var consecutiveSilenceFailures: Int = 0
+    private var consecutiveTempFailureRetries: Int = 0
     internal var lastListenRetryDelayMsForTest: Long? = null
 
     internal var byoAiClientOverride: ByoAiClient? = null
@@ -322,28 +323,36 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
             }
         }
         // Only re-arm listening when TTS completes the active response naturally (onDone), never when
-        // interrupted by user stop/mute or stale from a superseded turn.
+        // interrupted by user stop/mute or stale/unrelated from another utterance.
         runtimeScope.launch {
             voiceController.ttsNaturalCompletions.collect { completedUtteranceId ->
                 val expectedUttId = expectedTtsUtteranceId
-                val matchesUtterance = expectedUttId == null || expectedUttId == completedUtteranceId
+                val matchesUtterance = expectedUttId != null && expectedUttId == completedUtteranceId
                 val turnToken = expectedTtsTurnToken
+                val state = voiceController.voiceState.value
                 if (matchesUtterance &&
                     activeTurnToken == turnToken &&
                     _isVoiceSessionActive.value &&
                     !brainConfig.value.muted &&
                     allowAutoFollowUpForCurrentTurn &&
-                    !_isBusy.value
+                    !_isBusy.value &&
+                    state != VoiceControllerState.STOPPED &&
+                    state != VoiceControllerState.PROCESSING &&
+                    state != VoiceControllerState.SPEAKING
                 ) {
                     expectedTtsUtteranceId = null
-                    scheduleFollowUpListening(delayMs = FOLLOW_UP_LISTEN_DELAY_MS, token = turnToken)
+                    scheduleFollowUpListening(
+                        delayMs = FOLLOW_UP_LISTEN_DELAY_MS,
+                        token = turnToken,
+                        reason = "tts_natural_completion"
+                    )
                 }
             }
         }
         runtimeScope.launch {
             voiceController.ttsSpeechFailures.collect { failedUtteranceId ->
                 val expectedUttId = expectedTtsUtteranceId
-                val matchesUtterance = expectedUttId == null || expectedUttId == failedUtteranceId
+                val matchesUtterance = expectedUttId != null && expectedUttId == failedUtteranceId
                 val turnToken = expectedTtsTurnToken
                 if (!matchesUtterance || activeTurnToken != turnToken) {
                     return@collect
@@ -352,8 +361,20 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
                 if (_isVoiceSessionActive.value || lastTurnInitiatedByVoice) {
                     _bannerMessage.value = voiceController.voiceError.value ?: "Voice playback interrupted."
                 }
-                if (_isVoiceSessionActive.value && !brainConfig.value.muted && allowAutoFollowUpForCurrentTurn && !_isBusy.value) {
-                    scheduleFollowUpListening(delayMs = FOLLOW_UP_LISTEN_DELAY_MS, token = turnToken)
+                val state = voiceController.voiceState.value
+                if (_isVoiceSessionActive.value &&
+                    !brainConfig.value.muted &&
+                    allowAutoFollowUpForCurrentTurn &&
+                    !_isBusy.value &&
+                    state != VoiceControllerState.STOPPED &&
+                    state != VoiceControllerState.PROCESSING &&
+                    state != VoiceControllerState.SPEAKING
+                ) {
+                    scheduleFollowUpListening(
+                        delayMs = FOLLOW_UP_LISTEN_DELAY_MS,
+                        token = turnToken,
+                        reason = "tts_speech_failure"
+                    )
                 }
             }
         }
@@ -368,21 +389,33 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
 
     private fun scheduleFollowUpListening(
         delayMs: Long = FOLLOW_UP_LISTEN_DELAY_MS,
-        token: Long = activeTurnToken
+        token: Long = activeTurnToken,
+        reason: String = "follow_up"
     ) {
         followUpListenJob?.cancel()
-        if (!_isVoiceSessionActive.value || brainConfig.value.muted || activeTurnToken != token) return
+        val voiceState = voiceController.voiceState.value
+        if (!_isVoiceSessionActive.value ||
+            brainConfig.value.muted ||
+            activeTurnToken != token ||
+            voiceState == VoiceControllerState.STOPPED
+        ) {
+            return
+        }
+        android.util.Log.d("JarvisVoice", "SCHEDULE_FOLLOW_UP delayMs=$delayMs reason=$reason token=$token")
         followUpListenJob = runtimeScope.launch {
             delay(delayMs)
             followUpListenJob = null
+            val curState = voiceController.voiceState.value
             if (activeTurnToken == token &&
                 _isVoiceSessionActive.value &&
+                !brainConfig.value.muted &&
                 !_isBusy.value &&
+                curState == VoiceControllerState.IDLE &&
                 !voiceController.isListeningOrPending() &&
                 !voiceController.isSpeaking.value &&
                 hasRecordAudioPermission()
             ) {
-                startAssistantListeningIfIdle(startForegroundServiceIfPermitted = false)
+                startAssistantListeningIfIdle(startForegroundServiceIfPermitted = false, isAutoRetry = true)
             }
         }
     }
@@ -392,6 +425,8 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     internal fun isTurnActiveForTest(): Boolean = activeTurnJob?.isActive == true
     internal fun isFollowUpScheduledForTest(): Boolean = followUpListenJob?.isActive == true
     internal fun getRapidTempFailureCountForTest(): Int = consecutiveRapidTempFailures
+    internal fun getSilenceFailureCountForTest(): Int = consecutiveSilenceFailures
+    internal fun getTempFailureRetryCountForTest(): Int = consecutiveTempFailureRetries
 
     fun hasRecordAudioPermission(): Boolean =
         ContextCompat.checkSelfPermission(
@@ -516,6 +551,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         followUpListenJob?.cancel()
         activeTurnJob?.cancel()
         val token = ++activeTurnToken
+        _isBusy.value = true
         activeTurnJob = runtimeScope.launch {
             var nextPrompt: String? = finalPrompt
             var nextAttached: Pair<String, Bitmap>? = attached
@@ -546,6 +582,11 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         if (activeTurnToken != token) return null
         _isBusy.value = true
         val cfg = brainConfig.value
+        voiceController.languageDetectionManager.detect(
+            rawInput = prompt,
+            preferredLanguage = cfg.preferredLanguage,
+            autoDetect = cfg.autoLanguageDetectionEnabled
+        )
         val userMsg = ChatMessageItem(
             role = "user",
             content = prompt,
@@ -690,6 +731,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
             if (activeTurnToken == token) {
                 _streamingMessage.value = null
                 _isBusy.value = false
+                voiceController.markProcessingFinished("turn_cancelled")
             }
             throw e
         } catch (e: Exception) {
@@ -733,6 +775,8 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         if (!isError) {
             consecutiveVoiceErrors = 0
             consecutiveRapidTempFailures = 0
+            consecutiveSilenceFailures = 0
+            consecutiveTempFailureRetries = 0
             allowAutoFollowUpForCurrentTurn = _isVoiceSessionActive.value && !cfg.muted
             if (cfg.voiceTtsEnabled && !cfg.muted) {
                 // Concurrent AudioRecord barge-in is disabled by default for Android 9 stability
@@ -742,22 +786,27 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
                 val spoke = voiceController.speak(
                     text = replyText,
                     enableBargeIn = allowBargeIn,
+                    brainConfig = cfg,
                     onBargeInDetected = { handleVoiceBargeIn() }
                 )
                 if (spoke) {
                     expectedTtsUtteranceId = voiceController.lastStartedUtteranceId()
                 } else {
                     expectedTtsUtteranceId = null
+                    voiceController.markProcessingFinished("turn_tts_not_started")
                     if (isVoiceContext && (!voiceController.isTtsReady() || voiceController.voiceError.value != null)) {
                         _bannerMessage.value = voiceController.voiceError.value ?: "Voice playback unavailable."
                     }
                     if (_isVoiceSessionActive.value && !cfg.muted && activeTurnToken == token) {
-                        scheduleFollowUpListening(delayMs = FOLLOW_UP_LISTEN_DELAY_MS, token = token)
+                        scheduleFollowUpListening(delayMs = FOLLOW_UP_LISTEN_DELAY_MS, token = token, reason = "tts_unavailable_fallback")
                     }
                 }
-            } else if (_isVoiceSessionActive.value && !cfg.muted && activeTurnToken == token) {
+            } else {
                 expectedTtsUtteranceId = null
-                scheduleFollowUpListening(delayMs = FOLLOW_UP_LISTEN_DELAY_MS, token = token)
+                voiceController.markProcessingFinished("turn_tts_muted_or_disabled")
+                if (_isVoiceSessionActive.value && !cfg.muted && activeTurnToken == token) {
+                    scheduleFollowUpListening(delayMs = FOLLOW_UP_LISTEN_DELAY_MS, token = token, reason = "tts_disabled_follow_up")
+                }
             }
             return
         }
@@ -765,6 +814,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         if (!isVoiceContext) {
             allowAutoFollowUpForCurrentTurn = false
             expectedTtsUtteranceId = null
+            voiceController.markProcessingFinished("non_voice_turn_error")
             return
         }
 
@@ -782,19 +832,24 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
             val spoke = voiceController.speak(
                 text = spokenNotice,
                 enableBargeIn = canAutoRearm && cfg.voiceBargeInEnabled && hasRecordAudioPermission(),
+                brainConfig = cfg,
                 onBargeInDetected = { handleVoiceBargeIn() }
             )
             if (spoke) {
                 expectedTtsUtteranceId = voiceController.lastStartedUtteranceId()
             } else {
                 expectedTtsUtteranceId = null
+                voiceController.markProcessingFinished("error_tts_not_started")
                 if (canAutoRearm && activeTurnToken == token) {
-                    scheduleFollowUpListening(delayMs = FOLLOW_UP_LISTEN_DELAY_MS, token = token)
+                    scheduleFollowUpListening(delayMs = FOLLOW_UP_LISTEN_DELAY_MS, token = token, reason = "error_tts_unavailable")
                 }
             }
-        } else if (canAutoRearm && activeTurnToken == token) {
+        } else {
             expectedTtsUtteranceId = null
-            scheduleFollowUpListening(delayMs = FOLLOW_UP_LISTEN_DELAY_MS, token = token)
+            voiceController.markProcessingFinished("error_tts_disabled")
+            if (canAutoRearm && activeTurnToken == token) {
+                scheduleFollowUpListening(delayMs = FOLLOW_UP_LISTEN_DELAY_MS, token = token, reason = "error_tts_disabled")
+            }
         }
     }
 
@@ -843,9 +898,11 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         allowAutoFollowUpForCurrentTurn = false
         consecutiveVoiceErrors = 0
         consecutiveRapidTempFailures = 0
+        consecutiveSilenceFailures = 0
+        consecutiveTempFailureRetries = 0
         _streamingMessage.value = null
         _isBusy.value = false
-        voiceController.cancelListening()
+        voiceController.cancelListening(reason = "stop_current_work")
         voiceController.stopSpeaking()
     }
 
@@ -857,16 +914,18 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
             return
         }
         if (voiceController.isListeningOrPending()) {
-            voiceController.stopListening()
+            voiceController.stopListening(reason = "toggle_voice_input")
             return
         }
+        voiceController.resumeFromStopped("toggle_voice_input")
         voiceController.startListening(
             onFinalResult = { spoken ->
                 sendUserMessage(spoken, openChatIfHome = false, initiatedByVoice = true)
             },
             onFailure = { msg ->
                 _bannerMessage.value = msg
-            }
+            },
+            isAutoRestart = false
         )
     }
 
@@ -878,11 +937,14 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         followUpListenJob?.cancel()
         consecutiveVoiceErrors = 0
         consecutiveRapidTempFailures = 0
+        consecutiveSilenceFailures = 0
+        consecutiveTempFailureRetries = 0
         lastListenRetryDelayMsForTest = null
         allowAutoFollowUpForCurrentTurn = true
+        voiceController.resumeFromStopped("start_in_app_voice_mode")
         _activeOverlay.value = OverlayType.NONE
         _isVoiceOnlyUiActive.value = true
-        return startAssistantListeningIfIdle(startForegroundServiceIfPermitted = true)
+        return startAssistantListeningIfIdle(startForegroundServiceIfPermitted = true, isAutoRetry = false)
     }
 
     fun interruptSpeechAndListen(): Boolean {
@@ -893,7 +955,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         expectedTtsUtteranceId = null
         allowAutoFollowUpForCurrentTurn = true
         voiceController.stopSpeaking(interruptedByBargeIn = true)
-        return startAssistantListeningIfIdle(startForegroundServiceIfPermitted = false)
+        return startAssistantListeningIfIdle(startForegroundServiceIfPermitted = false, isAutoRetry = false)
     }
 
     fun activateVoiceOnlyUi(
@@ -904,8 +966,11 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         if (accepted) {
             consecutiveVoiceErrors = 0
             consecutiveRapidTempFailures = 0
+            consecutiveSilenceFailures = 0
+            consecutiveTempFailureRetries = 0
             lastListenRetryDelayMsForTest = null
             allowAutoFollowUpForCurrentTurn = true
+            voiceController.resumeFromStopped("activate_voice_only_ui")
             _isVoiceOnlyUiActive.value = true
             _isVoiceSessionActive.value = true
         }
@@ -949,10 +1014,21 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         }
     }
 
-    fun startAssistantListeningIfIdle(startForegroundServiceIfPermitted: Boolean = true): Boolean {
+    fun startAssistantListeningIfIdle(
+        startForegroundServiceIfPermitted: Boolean = true,
+        isAutoRetry: Boolean = false
+    ): Boolean {
         followUpListenJob?.cancel()
         if (!hasRecordAudioPermission()) {
             _bannerMessage.value = "Microphone permission is needed to listen in background."
+            return false
+        }
+        if (!isAutoRetry) {
+            consecutiveSilenceFailures = 0
+            consecutiveTempFailureRetries = 0
+            consecutiveRapidTempFailures = 0
+            voiceController.resumeFromStopped("start_assistant_listening")
+        } else if (voiceController.voiceState.value == VoiceControllerState.STOPPED) {
             return false
         }
         _isVoiceSessionActive.value = true
@@ -960,22 +1036,27 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         if (startForegroundServiceIfPermitted) {
             VoiceAssistantForegroundService.start(context)
         }
-        if (_isBusy.value || voiceController.isListeningOrPending()) {
+        val state = voiceController.voiceState.value
+        if (_isBusy.value ||
+            state == VoiceControllerState.PROCESSING ||
+            state == VoiceControllerState.SPEAKING ||
+            voiceController.isListeningOrPending()
+        ) {
             return false
-        }
-        if (voiceController.isSpeaking.value) {
-            voiceController.stopSpeaking(interruptedByBargeIn = true)
         }
         val listenTurnToken = activeTurnToken
         voiceController.startListening(
             onFinalResult = { spoken ->
                 consecutiveRapidTempFailures = 0
+                consecutiveSilenceFailures = 0
+                consecutiveTempFailureRetries = 0
                 sendUserMessage(spoken, openChatIfHome = false, initiatedByVoice = true)
             },
             onFailure = { /* Handled contextually in onRecognitionFailure for continuous mode */ },
             onRecognitionFailure = { failure ->
                 handleContinuousRecognitionFailure(failure, listenTurnToken)
-            }
+            },
+            isAutoRestart = isAutoRetry
         )
         return true
     }
@@ -984,24 +1065,60 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         failure: RecognitionFailure,
         listenTurnToken: Long
     ) {
-        if (!_isVoiceSessionActive.value || activeTurnToken != listenTurnToken) return
+        if (!_isVoiceSessionActive.value ||
+            activeTurnToken != listenTurnToken ||
+            voiceController.voiceState.value == VoiceControllerState.STOPPED
+        ) {
+            return
+        }
         if (_isBusy.value || voiceController.isSpeaking.value || voiceController.isListeningOrPending()) return
 
         when (failure.kind) {
             RecognitionFailureKind.PERMISSION_DENIED,
             RecognitionFailureKind.UNAVAILABLE -> {
+                lastListenRetryDelayMsForTest = null
                 _bannerMessage.value = failure.message
             }
             RecognitionFailureKind.SILENCE_OR_EMPTY -> {
                 consecutiveRapidTempFailures = 0
-                lastListenRetryDelayMsForTest = RETRY_SILENCE_DELAY_MS
-                scheduleFollowUpListening(delayMs = RETRY_SILENCE_DELAY_MS, token = listenTurnToken)
+                consecutiveTempFailureRetries = 0
+                consecutiveSilenceFailures += 1
+                if (consecutiveSilenceFailures > MAX_CONSECUTIVE_SILENCE_RETRIES) {
+                    lastListenRetryDelayMsForTest = null
+                    followUpListenJob?.cancel()
+                    _bannerMessage.value = "Listening paused after extended silence. Tap the orb to speak."
+                    return
+                }
+                val delayMs = when (consecutiveSilenceFailures) {
+                    1, 2, 3 -> RETRY_SILENCE_DELAY_MS
+                    4 -> 1500L
+                    5 -> 3000L
+                    else -> 5000L
+                }
+                lastListenRetryDelayMsForTest = delayMs
+                scheduleFollowUpListening(
+                    delayMs = delayMs,
+                    token = listenTurnToken,
+                    reason = "silence_retry_$consecutiveSilenceFailures"
+                )
             }
             RecognitionFailureKind.RECOGNIZER_BUSY,
             RecognitionFailureKind.TEMPORARY -> {
+                consecutiveSilenceFailures = 0
+                consecutiveTempFailureRetries += 1
+                if (consecutiveTempFailureRetries > MAX_CONSECUTIVE_TEMP_RETRIES) {
+                    lastListenRetryDelayMsForTest = null
+                    followUpListenJob?.cancel()
+                    _bannerMessage.value = failure.message
+                    return
+                }
                 val delayMs = computeTemporaryRecognitionRetryDelayMs(failure)
                 lastListenRetryDelayMsForTest = delayMs
-                scheduleFollowUpListening(delayMs = delayMs, token = listenTurnToken)
+                scheduleFollowUpListening(
+                    delayMs = delayMs,
+                    token = listenTurnToken,
+                    reason = "temp_retry_$consecutiveTempFailureRetries"
+                )
             }
         }
     }
@@ -1045,6 +1162,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         _isVoiceOnlyUiActive.value = false
         toolExecutor.clearPendingConfirmation()
         stopCurrentWork()
+        voiceController.stopSession("stop_assistant")
         VoiceAssistantForegroundService.stop(context)
     }
 
@@ -1052,7 +1170,7 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
         // Keep active Siri-style voice session running in background when UI is hidden.
         if (_isVoiceSessionActive.value) return
         if (voiceController.isListening.value) {
-            voiceController.stopListening()
+            voiceController.stopListening(reason = "activity_stopped_non_session")
         }
     }
 
@@ -1593,6 +1711,8 @@ class JarvisAssistantRuntime private constructor(appContext: Context) {
     companion object {
         private const val MAX_ROUTINE_CHAIN_DEPTH = 2
         private const val MAX_CONSECUTIVE_VOICE_ERRORS = 2
+        internal const val MAX_CONSECUTIVE_SILENCE_RETRIES = 6
+        internal const val MAX_CONSECUTIVE_TEMP_RETRIES = 6
         internal const val FOLLOW_UP_LISTEN_DELAY_MS = 350L
         internal const val RETRY_SILENCE_DELAY_MS = 500L
         internal const val RETRY_TEMP_ERROR_DELAY_MS = 550L
